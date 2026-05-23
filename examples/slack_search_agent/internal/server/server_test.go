@@ -371,6 +371,91 @@ func TestConnect_StripsAXHistoryEnvelope(t *testing.T) {
 	}
 }
 
+// TestConnect_PrefersStructuredSubagentPrompt locks in that when the AX
+// planner populates the new structured AgentStart.subagent_prompt field
+// (added to proto/ax.proto), the subagent uses it directly without
+// touching messages[0] / the legacy envelope.
+//
+// This is the modern contract: the planner forwards Gemini's typed
+// {history, prompt} function-call args as structured proto fields. The
+// legacy "History Summary:\n…\nPrompt:\n…" envelope is still synthesized
+// into messages[0] for backward compatibility, but modern subagents
+// should ignore it when subagent_prompt is set.
+func TestConnect_PrefersStructuredSubagentPrompt(t *testing.T) {
+	fake := &fakeHTTPClient{body: zeroMatchBody}
+	srv := New("xoxp-test", WithHTTPClient(fake))
+	client := newTestClient(t, srv)
+
+	// Both fields populated (matches what gemini_planner.go writes after
+	// this change). The structured prompt should win — the envelope in
+	// messages[0] is intentionally noisy / different to prove it is
+	// NOT consulted.
+	envelope := "History Summary:\nuser: ignore me\n\nPrompt:\nignore me too"
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{
+			Messages:        []*proto.Message{userMessage(envelope)},
+			SubagentPrompt:  "latest from Erica",
+			SubagentHistory: "user: What is the latest thing Erica said?",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = readAssistantText(t, stream)
+
+	if len(fake.requests) != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	}
+	body, err := io.ReadAll(fake.requests[0].Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	if got := form.Get("query"); got != "latest from Erica" {
+		t.Errorf("Slack query = %q, want %q (structured subagent_prompt should win)", got, "latest from Erica")
+	}
+}
+
+// TestConnect_FallsBackToMessagesWhenSubagentPromptEmpty locks in the
+// backward-compat path: when the structured subagent_prompt is empty
+// (legacy planner, direct caller, etc.), we still pull the query from
+// messages[0] and strip the legacy envelope.
+func TestConnect_FallsBackToMessagesWhenSubagentPromptEmpty(t *testing.T) {
+	fake := &fakeHTTPClient{body: zeroMatchBody}
+	srv := New("xoxp-test", WithHTTPClient(fake))
+	client := newTestClient(t, srv)
+
+	envelope := "History Summary:\nuser: What is the latest thing Erica said?\n\nPrompt:\nlatest from Erica"
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{
+			Messages: []*proto.Message{userMessage(envelope)},
+			// SubagentPrompt deliberately unset.
+		},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = readAssistantText(t, stream)
+
+	if len(fake.requests) != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	}
+	body, err := io.ReadAll(fake.requests[0].Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	if got := form.Get("query"); got != "latest from Erica" {
+		t.Errorf("Slack query = %q, want %q (legacy envelope fallback)", got, "latest from Erica")
+	}
+}
+
 func TestConnect_StripsBotMention(t *testing.T) {
 	fake := &fakeHTTPClient{body: zeroMatchBody}
 	srv := New("xoxp-test", WithHTTPClient(fake))

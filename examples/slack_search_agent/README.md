@@ -75,6 +75,26 @@ Granular search scopes only — no legacy `search:read`. Add these to
 - `search:read.mpim` (optional)
 - `search:read.files` (optional)
 
+## How the prompt is read
+
+The Slack query string can arrive in either of two ways, in priority
+order:
+
+1. **Structured field (preferred).** When the AX planner invokes us as
+   a subagent, it sets `AgentStart.subagent_prompt` directly from
+   Gemini's typed `prompt` function-call argument. We use it as-is —
+   no envelope parsing, no `lastUserText` scan.
+
+2. **Legacy `messages[]` envelope (back-compat).** When
+   `subagent_prompt` is empty (direct callers via `grpcurl`,
+   pre-structured-field planners), we fall back to scanning
+   `start.messages` for the most recent user-text message and peeling
+   off the planner's `"History Summary:\n…\nPrompt:\n…"` envelope if
+   present.
+
+See [DESIGN.md](./DESIGN.md) for the full migration story and
+backward-compatibility guarantee.
+
 ## Smoke test (no K8s)
 
 ```bash

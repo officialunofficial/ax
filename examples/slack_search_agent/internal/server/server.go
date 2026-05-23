@@ -106,15 +106,28 @@ func (s *Server) Connect(req *proto.AgentRequest, stream grpc.ServerStreamingSer
 	if start == nil {
 		return errors.New("AgentRequest.Start is required")
 	}
-	raw, ok := lastUserText(start.Messages)
-	if !ok {
-		return errors.New("no user message with text content found")
+	// Prefer the structured AgentStart.subagent_prompt field (modern
+	// contract added to proto/ax.proto): the AX planner forwards
+	// Gemini's typed `prompt` function-call arg directly, so we get a
+	// clean string with no envelope wrapping. Falls back to scanning
+	// messages for the legacy "History Summary:\n…\nPrompt:\n…"
+	// envelope when subagent_prompt is empty — covers direct (non-AX)
+	// callers and pre-structured-field planners.
+	raw := start.GetSubagentPrompt()
+	if raw == "" {
+		var ok bool
+		raw, ok = lastUserText(start.Messages)
+		if !ok {
+			return errors.New("no user message with text content found")
+		}
+		// Order matters: peel the AX planner's
+		// "History Summary:\n…\nPrompt:\n…" envelope FIRST (when
+		// present), then strip any leading bot mention from the inner
+		// prompt. Direct (non-AX) callers skip the first transform via
+		// the helper's no-delimiter fast path.
+		raw = stripAXHistoryEnvelope(raw)
 	}
-	// Order matters: peel the AX planner's "History Summary:\n…\nPrompt:\n…"
-	// envelope FIRST (when present), then strip any leading bot mention
-	// from the inner prompt. Direct (non-AX) callers skip the first
-	// transform via the helper's no-delimiter fast path.
-	query := stripBotMention(stripAXHistoryEnvelope(raw))
+	query := stripBotMention(raw)
 
 	var body string
 	if query == "" {

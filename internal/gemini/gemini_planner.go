@@ -352,6 +352,18 @@ func (p *geminiPlannerAgent) handleSubagentCall(ctx context.Context, conversatio
 		historyStr.WriteString("\n")
 	}
 
+	// Capture Gemini's typed `history` arg for the structured field. We
+	// preserve it as-is because it's the model's own summarization (often
+	// tighter than our role-prefixed stringification of `history`). Empty
+	// string when the model omitted the arg.
+	subagentHistoryArg, _ := fc.Args["history"].(string)
+
+	// Populate BOTH the new structured fields (modern contract — typed
+	// access to Gemini's function-call args) AND the legacy
+	// "History Summary:\n…\nPrompt:\n…" envelope as messages[0]
+	// (back-compat — subagents written before this proto field addition
+	// still work unmodified). See AgentStart.subagent_prompt in
+	// proto/ax.proto for the migration story.
 	subagentStart := &proto.AgentStart{
 		AgentId: mappedName,
 		Messages: []*proto.Message{
@@ -364,6 +376,8 @@ func (p *geminiPlannerAgent) handleSubagentCall(ctx context.Context, conversatio
 				},
 			},
 		},
+		SubagentPrompt:  prompt,
+		SubagentHistory: subagentHistoryArg,
 	}
 
 	var subagentOutputs []*proto.Message

@@ -336,6 +336,97 @@ func TestHandleSubagentCall_Success(t *testing.T) {
 	}
 }
 
+// TestHandleSubagentCall_PopulatesStructuredAndLegacyFields asserts that
+// when the planner dispatches to a subagent, the AgentStart it sends
+// downstream populates BOTH:
+//
+//  1. The new structured fields (subagent_prompt / subagent_history) —
+//     the modern contract; subagents read these directly.
+//  2. The legacy "History Summary:\n…\nPrompt:\n…" envelope as messages[0] —
+//     so subagents written against the old contract still work
+//     unmodified.
+//
+// This is the backward-compatibility guarantee for the proto field
+// addition: purely additive, no behavior removed.
+func TestHandleSubagentCall_PopulatesStructuredAndLegacyFields(t *testing.T) {
+	var capturedStart *proto.AgentStart
+	mockExec := &mockExecutor{
+		execFunc: func(ctx context.Context, conversationID string, execID string, start *proto.AgentStart, o agent.OutputHandler) (proto.State, error) {
+			capturedStart = start
+			o(&proto.AgentOutputs{
+				Messages: []*proto.Message{
+					{
+						Role: "model",
+						Content: &proto.Content{
+							Type: &proto.Content_Text{
+								Text: &proto.TextContent{Text: "ok"},
+							},
+						},
+					},
+				},
+			})
+			return proto.State_STATE_COMPLETED, nil
+		},
+	}
+
+	p := &geminiPlannerAgent{
+		config: GeminiPlannerConfig{
+			GeminiConfig: &config.GeminiConfig{Model: "test-model"},
+		},
+	}
+
+	fc := &genai.FunctionCall{
+		Name: "test-subagent",
+		Args: map[string]any{
+			"history": "Previous history summary",
+			"prompt":  "Current user prompt",
+		},
+	}
+
+	history := []*proto.Message{
+		{
+			Role: "user",
+			Content: &proto.Content{
+				Type: &proto.Content_Text{Text: &proto.TextContent{Text: "what's up"}},
+			},
+		},
+	}
+
+	handler := func(outgoing *proto.AgentOutputs) error { return nil }
+
+	if err := p.handleSubagentCall(context.Background(), "test-conv", fc, nil, history, mockExec, handler); err != nil {
+		t.Fatalf("handleSubagentCall failed: %v", err)
+	}
+
+	if capturedStart == nil {
+		t.Fatal("expected executor to receive an AgentStart")
+	}
+
+	// Modern contract: structured fields populated from typed FunctionCall args.
+	if got, want := capturedStart.GetSubagentPrompt(), "Current user prompt"; got != want {
+		t.Errorf("SubagentPrompt = %q, want %q", got, want)
+	}
+	if got, want := capturedStart.GetSubagentHistory(), "Previous history summary"; got != want {
+		t.Errorf("SubagentHistory = %q, want %q", got, want)
+	}
+
+	// Legacy contract: envelope still present in messages[0] so existing
+	// subagents that read only the messages list keep working.
+	if n := len(capturedStart.Messages); n != 1 {
+		t.Fatalf("expected exactly 1 legacy envelope message, got %d", n)
+	}
+	envelopeText := capturedStart.Messages[0].GetContent().GetText().GetText()
+	if !strings.Contains(envelopeText, "History Summary:") {
+		t.Errorf("legacy envelope missing 'History Summary:' header: %q", envelopeText)
+	}
+	if !strings.Contains(envelopeText, "Prompt:") {
+		t.Errorf("legacy envelope missing 'Prompt:' delimiter: %q", envelopeText)
+	}
+	if !strings.Contains(envelopeText, "Current user prompt") {
+		t.Errorf("legacy envelope missing the prompt body: %q", envelopeText)
+	}
+}
+
 func TestHandleSubagentCall_MissingArgs(t *testing.T) {
 	p := &geminiPlannerAgent{}
 	fc := &genai.FunctionCall{

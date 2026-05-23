@@ -616,3 +616,81 @@ func TestProcess_AppendsNativeToolsFromConfig(t *testing.T) {
 		t.Errorf("captured config.Tools does not contain a GoogleSearch entry; got %d tools", len(captured.Tools))
 	}
 }
+
+// TestProcess_MergesNativeToolsWithFunctionDeclarations locks in the Gemini
+// docs requirement: when native tools (like GoogleSearch) coexist with
+// custom function declarations, they must share ONE Tool object. Splitting
+// across multiple Tool entries causes Gemini 3 to emit the native tool's
+// name as a regular function call instead of auto-executing it server-side
+// (verified empirically against gemini-3-flash-preview on Vertex).
+//
+// Expected shape: every FunctionDeclaration the planner produced for
+// registered AX agents lives on the SAME *genai.Tool that carries the
+// GoogleSearch (or other built-in) declaration.
+func TestProcess_MergesNativeToolsWithFunctionDeclarations(t *testing.T) {
+	var captured *genai.GenerateContentConfig
+	mockGen := &mockContentGenerator{
+		generateContentFunc: func(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
+			captured = cfg
+			return &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{{
+					Content: &genai.Content{Parts: []*genai.Part{{Text: "ok"}}},
+				}},
+			}, nil
+		},
+	}
+
+	registry := &mockAgentRegistry{
+		listFunc: func() []string { return []string{"slacksearch", "py"} },
+		getInfoFunc: func(id string) (*agent.AgentInfo, error) {
+			return &agent.AgentInfo{ID: id, Name: id, Description: "test"}, nil
+		},
+	}
+
+	p := &geminiPlannerAgent{
+		client:   mockGen,
+		registry: registry,
+		config: GeminiPlannerConfig{
+			GeminiConfig: &config.GeminiConfig{
+				Model:        "test-model",
+				SystemPrompt: "test",
+				Tools:        []string{"google_search"},
+			},
+		},
+	}
+
+	start := &proto.AgentStart{Messages: []*proto.Message{{
+		Role: "user",
+		Content: &proto.Content{
+			Type: &proto.Content_Text{Text: &proto.TextContent{Text: "x"}},
+		},
+	}}}
+	_, _, err := p.process(context.Background(), "conv-merged", start, nil, func(o *proto.AgentOutputs) error { return nil })
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("GenerateContent was never called")
+	}
+
+	// Find the Tool carrying GoogleSearch and assert it ALSO has the
+	// function declarations (not split across separate Tool entries).
+	var gsTool *genai.Tool
+	for _, tool := range captured.Tools {
+		if tool != nil && tool.GoogleSearch != nil {
+			gsTool = tool
+			break
+		}
+	}
+	if gsTool == nil {
+		t.Fatal("no Tool carries GoogleSearch")
+	}
+	if len(gsTool.FunctionDeclarations) < 2 {
+		t.Errorf("GoogleSearch Tool has %d FunctionDeclarations; want >=2 (slacksearch + py merged onto same Tool)", len(gsTool.FunctionDeclarations))
+	}
+	// Belt+suspenders: assert there are NOT also separate Tool entries
+	// each holding one FunctionDeclaration (the old multi-Tool shape).
+	if len(captured.Tools) != 1 {
+		t.Errorf("captured.Tools has %d entries; want 1 merged Tool (combining FunctionDeclarations + GoogleSearch on one Tool is required by Gemini docs)", len(captured.Tools))
+	}
+}

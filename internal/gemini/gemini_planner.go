@@ -195,27 +195,43 @@ func (p *geminiPlannerAgent) loop(ctx context.Context, conversationID string, st
 }
 
 func (p *geminiPlannerAgent) process(ctx context.Context, conversationID string, start *proto.AgentStart, e agent.Executor, handler agent.OutputHandler) (agentID string, keepLooping bool, err error) {
-	tools, err := agentsToTools(p.registry)
+	rawTools, err := agentsToTools(p.registry)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to convert agents to tools: %w", err)
 	}
-	// Append any native Gemini tools listed in config (google_search,
-	// url_context, code_execution, …). These coexist with the function
-	// declarations for AX subagents — Gemini decides which to use.
+
+	// When native Gemini tools (google_search, url_context, …) are
+	// configured, ALL function declarations + the native tool must live
+	// on the SAME *genai.Tool object. Splitting across multiple Tool
+	// entries causes Gemini 3 to emit the native tool's name as a
+	// regular function call instead of auto-executing it server-side
+	// (empirically confirmed against gemini-3-flash-preview on Vertex).
+	// See https://ai.google.dev/gemini-api/docs/tool-combination
+	//
+	// Flatten agentsToTools' one-Tool-per-agent output into a single
+	// Tool, then attach the configured natives.
+	mergedTool := &genai.Tool{}
+	for _, t := range rawTools {
+		if t == nil {
+			continue
+		}
+		mergedTool.FunctionDeclarations = append(mergedTool.FunctionDeclarations, t.FunctionDeclarations...)
+	}
 	for _, t := range p.config.GeminiConfig.Tools {
 		switch t {
 		case "google_search":
-			tools = append(tools, &genai.Tool{GoogleSearch: &genai.GoogleSearch{}})
+			mergedTool.GoogleSearch = &genai.GoogleSearch{}
 		case "url_context":
-			tools = append(tools, &genai.Tool{URLContext: &genai.URLContext{}})
+			mergedTool.URLContext = &genai.URLContext{}
 		case "code_execution":
-			tools = append(tools, &genai.Tool{CodeExecution: &genai.ToolCodeExecution{}})
+			mergedTool.CodeExecution = &genai.ToolCodeExecution{}
 		case "google_maps":
-			tools = append(tools, &genai.Tool{GoogleMaps: &genai.GoogleMaps{}})
+			mergedTool.GoogleMaps = &genai.GoogleMaps{}
 		default:
 			return "", false, fmt.Errorf("unsupported native planner tool: %q", t)
 		}
 	}
+	tools := []*genai.Tool{mergedTool}
 
 	inputs := start.Messages
 	if fc, approved := p.handleConfirmationAnswer(inputs); fc != nil {

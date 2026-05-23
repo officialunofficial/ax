@@ -12,7 +12,7 @@ require (
 	github.com/slack-go/slack v0.23.1
 	github.com/spf13/cobra v1.10.2
 	golang.org/x/sync v0.20.0
-	google.golang.org/genai v1.43.0
+	google.golang.org/genai v1.58.0
 	google.golang.org/genproto/googleapis/rpc v0.0.0-20260406210006-6f92a3bedf2d
 	google.golang.org/grpc v1.81.0
 	google.golang.org/protobuf v1.36.12-0.20260120151049-f2248ac996af

@@ -152,6 +152,14 @@ func (s *Server) search(ctx context.Context, query string) string {
 	form := url.Values{}
 	form.Set("query", query)
 	form.Set("limit", "10")
+	// Recency-first is the right default for an assistant: the LLM
+	// consumer gets the 10 most recent matches and can decide which
+	// are relevant. Default semantic ranking misses recent short
+	// messages — empirically observed when "latest thing Erica said"
+	// returned older substantive messages while skipping a recent
+	// short "bonjour @Uno" reply.
+	form.Set("sort", "timestamp")
+	form.Set("sort_dir", "desc")
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.slackBaseURL, strings.NewReader(form.Encode()))
 	if err != nil {

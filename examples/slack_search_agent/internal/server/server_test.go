@@ -275,6 +275,47 @@ func TestConnect_RejectsMissingStart(t *testing.T) {
 	}
 }
 
+// TestConnect_SortsByTimestampDescending locks in that the Slack call
+// requests recency-sorted results (sort=timestamp&sort_dir=desc).
+// Default semantic ranking misses recent short messages — e.g. a query
+// for "latest thing Erica said" returned Erica's substantive May 9-20
+// messages but never surfaced her May 22 "bonjour @Uno" reply because
+// the short greeting ranked low semantically.
+//
+// Recency-first is the right default for an assistant: the LLM consumer
+// gets the 10 most recent matches and can decide which are relevant.
+func TestConnect_SortsByTimestampDescending(t *testing.T) {
+	fake := &fakeHTTPClient{body: zeroMatchBody}
+	srv := New("xoxp-test", WithHTTPClient(fake))
+	client := newTestClient(t, srv)
+
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("anything")}},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = readAssistantText(t, stream)
+
+	if len(fake.requests) != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	}
+	body, err := io.ReadAll(fake.requests[0].Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	if got := form.Get("sort"); got != "timestamp" {
+		t.Errorf("sort = %q, want %q", got, "timestamp")
+	}
+	if got := form.Get("sort_dir"); got != "desc" {
+		t.Errorf("sort_dir = %q, want %q", got, "desc")
+	}
+}
+
 // TestConnect_StripsAXHistoryEnvelope locks in that when AX's planner
 // invokes this subagent with the synthesized
 //

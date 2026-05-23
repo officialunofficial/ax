@@ -1,0 +1,25 @@
+substitutions:
+  _TAG: manual
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=cmd/ax/Dockerfile
+      - --tag=us-east4-docker.pkg.dev/official-unofficial/docker/ax-server:${_TAG}
+      - --tag=us-east4-docker.pkg.dev/official-unofficial/docker/ax-server:latest
+      - .
+  - id: push-tag
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-east4-docker.pkg.dev/official-unofficial/docker/ax-server:${_TAG}
+  - id: push-latest
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-east4-docker.pkg.dev/official-unofficial/docker/ax-server:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY

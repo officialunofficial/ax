@@ -44,7 +44,40 @@ behavior).
 
 ## Files
 
-- `internal/harness/agentsandbox.go` — `AgentSandboxHarness` + `agentSandboxExecution`
-- `internal/experimental/k8s/agentsandbox/client.go` — k8s client wrapper
-- `internal/harness/agentsandbox_test.go` — unit tests with mocked client
-- `internal/server/server_agentsandbox.go` — selection in server startup
+- `internal/experimental/k8s/agentsandbox/client.go` — k8s client wrapper ✅
+- `internal/experimental/k8s/agentsandbox/client_test.go` — 10 tests ✅
+- `internal/harness/agentsandbox.go` — `AgentSandboxHarness` + `agentSandboxExecution` ✅
+- `internal/harness/agentsandbox_test.go` — 8 tests ✅
+- `internal/controller2/registry_agentsandbox.go` — TODO, blocked on upstream
+- `cmd/ax/main.go` env-gated selection — TODO, blocked on upstream
+
+## Why we stopped at Phase B
+
+`NewSubstrateHarness` is **never called anywhere** in AX `main` as of 2026-05-23.
+The harness type exists; the wiring into a running `ax serve` does not.
+Wiring happens at the Agent registry layer (`controller2/Registry`), not the
+Harness layer — these are distinct abstractions:
+
+- `harness.Harness` (this file): per-conversation execution boundary; what we
+  implemented in `agentsandbox.go`.
+- `agent.Agent` (controller2/registry): per-task callable invokable by name;
+  what AX's runtime actually dispatches to. `RegisterATE` registers a
+  `SubstrateAgent` from `internal/experimental/agent/`, not a
+  `SubstrateHarness` from this package.
+
+Upstream has an in-progress `u/anj/harness-interface-2` branch that adds an
+`Antigravity` harness + new `controller2/registry` wiring (commit `7b7d8bd`,
+12 files changed). `SUBSTRATE_REFACTOR_CLEANUPS.md` also lists "Update
+HarnessService with the actual protocol" — confirming the protocol layer
+is still moving.
+
+If we add a `RegisterAgentSandbox` to the registry now, it will conflict
+with whichever pattern upstream merges. So we hold here until either:
+
+  1. `u/anj/harness-interface-2` (or its successor) merges to main, OR
+  2. We get explicit signal from upstream on the harness↔agent contract.
+
+When that happens the integration work is small:
+  - mirror whatever `RegisterAntigravity` (or equivalent) ends up looking like
+  - thread the `AgentSandboxHarness` through that registration
+  - env-gate selection (`AX_AGENT_SANDBOX=1`) in `cmd/ax/main.go`

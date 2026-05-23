@@ -19,6 +19,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -101,32 +102,43 @@ func readAssistantText(t *testing.T, stream proto.AgentService_ConnectClient) st
 	return msgs[0].GetContent().GetText().Text
 }
 
+// Modern assistant.search.context response shape:
+//
+//	{ "ok": true, "results": { "messages": [...], "files": [], ... } }
 const twoMatchBody = `{
   "ok": true,
-  "messages": {
-    "total": 2,
-    "matches": [
+  "results": {
+    "messages": [
       {
-        "type": "message",
-        "channel": {"id": "C111", "name": "general"},
-        "username": "alice",
-        "ts": "1700000000.000100",
-        "text": "we agreed to ship friday",
-        "permalink": "https://example.slack.com/archives/C111/p1700000000000100"
+        "author_name": "alice",
+        "author_user_id": "U111",
+        "channel_id": "C111",
+        "channel_name": "general",
+        "message_ts": "1700000000.000100",
+        "content": "we agreed to ship friday",
+        "permalink": "https://example.slack.com/archives/C111/p1700000000000100",
+        "is_author_bot": false,
+        "reply_count": 0
       },
       {
-        "type": "message",
-        "channel": {"id": "C222", "name": "random"},
-        "username": "bob",
-        "ts": "1700000100.000200",
-        "text": "lunch at noon",
-        "permalink": "https://example.slack.com/archives/C222/p1700000100000200"
+        "author_name": "bob",
+        "author_user_id": "U222",
+        "channel_id": "C222",
+        "channel_name": "random",
+        "message_ts": "1700000100.000200",
+        "content": "lunch at noon",
+        "permalink": "https://example.slack.com/archives/C222/p1700000100000200",
+        "is_author_bot": false,
+        "reply_count": 2
       }
-    ]
+    ],
+    "files": [],
+    "channels": [],
+    "users": []
   }
 }`
 
-const zeroMatchBody = `{"ok":true,"messages":{"total":0,"matches":[]}}`
+const zeroMatchBody = `{"ok":true,"results":{"messages":[],"files":[],"channels":[],"users":[]}}`
 
 const slackErrorBody = `{"ok":false,"error":"invalid_auth"}`
 
@@ -152,14 +164,28 @@ func TestConnect_QueriesSlackWithLatestUserText(t *testing.T) {
 		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
 	}
 	req := fake.requests[0]
+	if req.Method != http.MethodPost {
+		t.Errorf("method = %q, want POST", req.Method)
+	}
 	if req.URL.Host != "slack.com" {
 		t.Errorf("host = %q, want slack.com", req.URL.Host)
 	}
-	if req.URL.Path != "/api/search.messages" {
-		t.Errorf("path = %q, want /api/search.messages", req.URL.Path)
+	if req.URL.Path != "/api/assistant.search.context" {
+		t.Errorf("path = %q, want /api/assistant.search.context", req.URL.Path)
 	}
-	if got := req.URL.Query().Get("query"); got != "project alpha launch" {
-		t.Errorf("query = %q, want %q", got, "project alpha launch")
+	if got := req.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
+		t.Errorf("Content-Type = %q, want application/x-www-form-urlencoded", got)
+	}
+	body, err := io.ReadAll(req.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	if got := form.Get("query"); got != "project alpha launch" {
+		t.Errorf("form query = %q, want %q", got, "project alpha launch")
 	}
 	if got := req.Header.Get("Authorization"); got != "Bearer xoxp-test-token" {
 		t.Errorf("Authorization = %q, want Bearer xoxp-test-token", got)
@@ -269,7 +295,15 @@ func TestConnect_StripsBotMention(t *testing.T) {
 	if len(fake.requests) != 1 {
 		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
 	}
-	if got := fake.requests[0].URL.Query().Get("query"); got != "what did we say about X" {
+	body, err := io.ReadAll(fake.requests[0].Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	if got := form.Get("query"); got != "what did we say about X" {
 		t.Errorf("query = %q, want %q", got, "what did we say about X")
 	}
 }

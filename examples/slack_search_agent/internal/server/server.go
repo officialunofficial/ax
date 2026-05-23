@@ -36,7 +36,13 @@ import (
 
 // slackSearchURL is the endpoint hit by every Connect call. Overridable
 // via WithSlackBaseURL for tests that want to point at a local fake.
-const slackSearchURL = "https://slack.com/api/search.messages"
+//
+// We use the Real-time Search API (assistant.search.context, GA Feb 2026)
+// rather than the classic search.messages, because the latter still
+// demands the legacy `search:read` scope while this one is paired with
+// the granular `search:read.public` / `.private` / `.im` / `.mpim` /
+// `.files` scopes our token holds.
+const slackSearchURL = "https://slack.com/api/assistant.search.context"
 
 // maxMatchTextLen caps each match body to keep responses scannable.
 const maxMatchTextLen = 200
@@ -64,7 +70,9 @@ type httpClient interface {
 }
 
 // New builds a Server. slackToken must be a Slack user token (xoxp-...)
-// with the search:read.* scopes. Bot tokens cannot call search.messages.
+// with the granular search:read.* scopes (search:read.public is the
+// minimum; .private/.im/.mpim/.files broaden the corpus). Bot tokens
+// (xoxb-) cannot search out-of-band.
 func New(slackToken string, opts ...Option) *Server {
 	s := &Server{
 		slackToken:   slackToken,
@@ -137,21 +145,16 @@ func (s *Server) Connect(req *proto.AgentRequest, stream grpc.ServerStreamingSer
 // transport / API errors are folded into the body itself so the caller
 // gets a single human-readable response rather than a gRPC error.
 func (s *Server) search(ctx context.Context, query string) string {
-	u, err := url.Parse(s.slackBaseURL)
-	if err != nil {
-		return fmt.Sprintf("internal error: invalid slack URL: %v", err)
-	}
-	q := u.Query()
-	q.Set("query", query)
-	q.Set("count", "10")
-	q.Set("sort", "timestamp")
-	u.RawQuery = q.Encode()
+	form := url.Values{}
+	form.Set("query", query)
+	form.Set("limit", "10")
 
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.slackBaseURL, strings.NewReader(form.Encode()))
 	if err != nil {
 		return fmt.Sprintf("internal error: build request: %v", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+s.slackToken)
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	req.Header.Set("Accept", "application/json")
 
 	httpResp, err := s.http.Do(req)
@@ -176,29 +179,33 @@ func (s *Server) search(ctx context.Context, query string) string {
 		}
 		return fmt.Sprintf("Slack search failed: %s", errMsg)
 	}
-	return formatMatches(query, parsed.Messages.Matches)
+	return formatMatches(query, parsed.Results.Messages)
 }
 
-// searchResponse models the bits of search.messages we use.
+// searchResponse models the bits of assistant.search.context we use.
+// Shape: { ok, results: { messages: [...] } }
 type searchResponse struct {
-	OK       bool   `json:"ok"`
-	Error    string `json:"error,omitempty"`
-	Messages struct {
-		Total   int          `json:"total"`
-		Matches []slackMatch `json:"matches"`
-	} `json:"messages"`
+	OK      bool   `json:"ok"`
+	Error   string `json:"error,omitempty"`
+	Results struct {
+		Messages []slackMatch `json:"messages"`
+	} `json:"results"`
 }
 
+// slackMatch mirrors the assistant.search.context message object —
+// flatter than the classic search.messages shape (channel_name, not
+// channel.name; author_name, not username; message_ts, not ts; content,
+// not text).
 type slackMatch struct {
-	Channel struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	} `json:"channel"`
-	Username  string `json:"username"`
-	User      string `json:"user"`
-	TS        string `json:"ts"`
-	Text      string `json:"text"`
-	Permalink string `json:"permalink"`
+	AuthorName  string `json:"author_name"`
+	AuthorID    string `json:"author_user_id"`
+	ChannelID   string `json:"channel_id"`
+	ChannelName string `json:"channel_name"`
+	MessageTS   string `json:"message_ts"`
+	Content     string `json:"content"`
+	Permalink   string `json:"permalink"`
+	IsBot       bool   `json:"is_author_bot"`
+	ReplyCount  int    `json:"reply_count"`
 }
 
 // formatMatches produces the human-readable body. Each match is its own
@@ -210,22 +217,22 @@ func formatMatches(query string, matches []slackMatch) string {
 	var b strings.Builder
 	fmt.Fprintf(&b, "Found %d messages for %q:\n\n", len(matches), query)
 	for i, m := range matches {
-		channelName := m.Channel.Name
+		channelName := m.ChannelName
 		if channelName == "" {
-			channelName = m.Channel.ID
+			channelName = m.ChannelID
 		}
-		who := m.Username
+		who := m.AuthorName
 		if who == "" {
-			who = m.User
+			who = m.AuthorID
 		}
 		if who == "" {
 			who = "unknown"
 		}
-		fmt.Fprintf(&b, "%d. #%s by %s at %s\n", i+1, channelName, who, humanTS(m.TS))
+		fmt.Fprintf(&b, "%d. #%s by %s at %s\n", i+1, channelName, who, humanTS(m.MessageTS))
 		if m.Permalink != "" {
 			fmt.Fprintf(&b, "   %s\n", m.Permalink)
 		}
-		fmt.Fprintf(&b, "   > %s\n", truncate(m.Text, maxMatchTextLen))
+		fmt.Fprintf(&b, "   > %s\n", truncate(m.Content, maxMatchTextLen))
 		if i < len(matches)-1 {
 			b.WriteString("\n")
 		}

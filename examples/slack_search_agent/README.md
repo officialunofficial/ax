@@ -2,11 +2,16 @@
 
 AX remote-agent example. Implements `proto.AgentService` over gRPC on
 `:8494`. On every `Connect()` call it takes the latest user-role
-message's text, queries Slack's [`search.messages`][slack-search] API,
-and streams a single human-readable `AgentResponse` containing the top
-10 matches.
+message's text, queries Slack's [Real-time Search API][slack-rts]
+(`assistant.search.context`), and streams a single human-readable
+`AgentResponse` containing the top 10 matches.
 
-[slack-search]: https://api.slack.com/methods/search.messages
+[slack-rts]: https://docs.slack.dev/apis/web-api/real-time-search-api/
+
+We use the modern Real-time Search API (GA Feb 2026) rather than the
+classic `search.messages`/`search.all` family — the classic endpoints
+still demand the legacy `search:read` scope, while the RTS endpoint is
+paired with the granular `search:read.*` scopes.
 
 ## Where it fits
 
@@ -18,7 +23,7 @@ AX server (ax serve)
 slack_search_agent gRPC :8494
      │
      ▼
-slack.com/api/search.messages
+slack.com/api/assistant.search.context
 ```
 
 Unlike `python_sandbox_agent`, this agent doesn't need a Sandbox /
@@ -45,8 +50,9 @@ In `ax.yaml`:
 ```yaml
 registry:
   remote_agents:
-    - id: slack
-      name: Slack Search Agent
+    - id: slack_search
+      name: Slack Search
+      description: Searches the team's Slack workspace for recent messages matching a query
       address: slack-search-agent.agent-platform.svc.cluster.local:8494
       protocol: axp
 ```
@@ -55,19 +61,19 @@ registry:
 
 | Variable           | Required | Default | Description |
 |--------------------|----------|---------|-------------|
-| `SLACK_USER_TOKEN` | yes      | —       | Slack user token (`xoxp-...`). Bot tokens cannot call `search.messages`. |
+| `SLACK_USER_TOKEN` | yes      | —       | Slack user token (`xoxp-...`). Bot tokens (`xoxb-`) cannot search out-of-band. |
 | `LISTEN_ADDR`      | no       | `:8494` | gRPC bind address. |
 
 ### Required Slack scopes
 
-The `search.messages` method is user-token-only. Issue an `xoxp-` token
-with whichever of these scopes match the surfaces you want to search:
+Granular search scopes only — no legacy `search:read`. Add these to
+**User Token Scopes** on the Slack app and reinstall:
 
-- `search:read.public`
-- `search:read.private`
-- `search:read.im`
-- `search:read.mpim`
-- `search:read.files`
+- `search:read.public` (minimum)
+- `search:read.private` (optional)
+- `search:read.im` (optional)
+- `search:read.mpim` (optional)
+- `search:read.files` (optional)
 
 ## Smoke test (no K8s)
 

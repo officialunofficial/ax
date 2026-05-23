@@ -24,6 +24,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	extv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
@@ -38,7 +39,7 @@ func newTestClient(t *testing.T, opts ...Option) *Client {
 	// silently but the value doesn't survive a subsequent Get().
 	fakeK8s := fake.NewClientBuilder().
 		WithScheme(scheme).
-		WithStatusSubresource(&sandboxv1alpha1.Sandbox{}).
+		WithStatusSubresource(&extv1alpha1.SandboxClaim{}).
 		Build()
 	allOpts := append([]Option{
 		WithCtrlClient(fakeK8s),
@@ -69,13 +70,14 @@ func TestCreateSandbox_CreatesCRAndWaitsForPodIP(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	// Simulate the controller populating .status.podIP shortly after Create.
+	// Simulate the controller populating .status.sandbox.podIPs shortly
+	// after the SandboxClaim is created.
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		var sb sandboxv1alpha1.Sandbox
-		_ = c.k8s.Get(ctx, types.NamespacedName{Name: "conv-1", Namespace: "agent-platform"}, &sb)
-		sb.Status.PodIPs = []string{"10.0.0.42"}
-		_ = c.k8s.Status().Update(ctx, &sb)
+		var claim extv1alpha1.SandboxClaim
+		_ = c.k8s.Get(ctx, types.NamespacedName{Name: "conv-1", Namespace: "agent-platform"}, &claim)
+		claim.Status.SandboxStatus.PodIPs = []string{"10.0.0.42"}
+		_ = c.k8s.Status().Update(ctx, &claim)
 	}()
 
 	got, err := c.CreateSandbox(ctx, "conv-1")
@@ -106,15 +108,17 @@ func TestCreateSandbox_AdoptsExistingSandbox(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	// Pre-create a Sandbox with status.podIP already set — simulates
-	// reconnecting to a conversation whose pod survived ax-server restart.
-	existing := &sandboxv1alpha1.Sandbox{
+	// Pre-create a SandboxClaim with status.sandbox.podIPs already set
+	// — simulates reconnecting to a conversation whose pod survived an
+	// ax-server restart.
+	existing := &extv1alpha1.SandboxClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "conv-2", Namespace: "agent-platform"},
+		Spec:       extv1alpha1.SandboxClaimSpec{TemplateRef: extv1alpha1.SandboxTemplateRef{Name: "python-sandbox-template"}},
 	}
 	if err := c.k8s.Create(ctx, existing); err != nil {
 		t.Fatalf("seed Create: %v", err)
 	}
-	existing.Status.PodIPs = []string{"10.0.0.99"}
+	existing.Status.SandboxStatus.PodIPs = []string{"10.0.0.99"}
 	if err := c.k8s.Status().Update(ctx, existing); err != nil {
 		t.Fatalf("seed Status update: %v", err)
 	}
@@ -132,22 +136,24 @@ func TestCreateSandbox_LabelsTheResource(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	// Drive the create then inspect the CR before status flips.
 	created := make(chan struct{})
 	go func() {
 		time.Sleep(20 * time.Millisecond)
-		var sb sandboxv1alpha1.Sandbox
-		_ = c.k8s.Get(ctx, types.NamespacedName{Name: "conv-lbl", Namespace: "agent-platform"}, &sb)
+		var claim extv1alpha1.SandboxClaim
+		_ = c.k8s.Get(ctx, types.NamespacedName{Name: "conv-lbl", Namespace: "agent-platform"}, &claim)
 		want := "python-sandbox-template"
-		if sb.Labels["ax.google/sandbox-template"] != want {
+		if claim.Labels["ax.google/sandbox-template"] != want {
 			t.Errorf("label ax.google/sandbox-template = %q, want %q",
-				sb.Labels["ax.google/sandbox-template"], want)
+				claim.Labels["ax.google/sandbox-template"], want)
 		}
-		if sb.Labels["ax.google/managed"] != "true" {
+		if claim.Labels["ax.google/managed"] != "true" {
 			t.Errorf("missing ax.google/managed=true label")
 		}
-		sb.Status.PodIPs = []string{"10.0.0.1"}
-		_ = c.k8s.Status().Update(ctx, &sb)
+		if claim.Spec.TemplateRef.Name != want {
+			t.Errorf("templateRef.name = %q, want %q", claim.Spec.TemplateRef.Name, want)
+		}
+		claim.Status.SandboxStatus.PodIPs = []string{"10.0.0.1"}
+		_ = c.k8s.Status().Update(ctx, &claim)
 		close(created)
 	}()
 
@@ -161,16 +167,17 @@ func TestDeleteSandbox_RemovesCR(t *testing.T) {
 	c := newTestClient(t)
 	ctx := context.Background()
 
-	if err := c.k8s.Create(ctx, &sandboxv1alpha1.Sandbox{
+	if err := c.k8s.Create(ctx, &extv1alpha1.SandboxClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: "to-delete", Namespace: "agent-platform"},
+		Spec:       extv1alpha1.SandboxClaimSpec{TemplateRef: extv1alpha1.SandboxTemplateRef{Name: "python-sandbox-template"}},
 	}); err != nil {
 		t.Fatalf("seed Create: %v", err)
 	}
 	if err := c.DeleteSandbox(ctx, "to-delete"); err != nil {
 		t.Fatalf("DeleteSandbox: %v", err)
 	}
-	var sb sandboxv1alpha1.Sandbox
-	err := c.k8s.Get(ctx, types.NamespacedName{Name: "to-delete", Namespace: "agent-platform"}, &sb)
+	var claim extv1alpha1.SandboxClaim
+	err := c.k8s.Get(ctx, types.NamespacedName{Name: "to-delete", Namespace: "agent-platform"}, &claim)
 	if err == nil || !apierrors.IsNotFound(err) {
 		t.Errorf("expected NotFound after delete, got err=%v", err)
 	}

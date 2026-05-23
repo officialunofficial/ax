@@ -24,7 +24,6 @@ import (
 	"fmt"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -34,6 +33,7 @@ import (
 	"k8s.io/client-go/rest"
 	"k8s.io/client-go/tools/clientcmd"
 	sandboxv1alpha1 "sigs.k8s.io/agent-sandbox/api/v1alpha1"
+	extv1alpha1 "sigs.k8s.io/agent-sandbox/extensions/api/v1alpha1"
 	ctrlclient "sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -44,6 +44,7 @@ var scheme = runtime.NewScheme()
 func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 	utilruntime.Must(sandboxv1alpha1.AddToScheme(scheme))
+	utilruntime.Must(extv1alpha1.AddToScheme(scheme))
 }
 
 // Client manages Sandbox CRs in a single namespace for a single template.
@@ -131,50 +132,60 @@ type Sandbox struct {
 	PodIP     string
 }
 
-// CreateSandbox creates a Sandbox CR named after the conversation ID,
-// templated on the configured SandboxTemplate's podTemplate. It blocks
-// until .status.podIP is populated or readyTimeout elapses.
+// CreateSandbox creates a SandboxClaim referencing the configured
+// SandboxTemplate. The agent-sandbox controller resolves the claim by
+// adopting a pod from a matching SandboxWarmPool (or by creating a fresh
+// Sandbox if no warm replica is available), and populates
+// status.sandbox.podIPs once the pod is ready.
 //
-// If a sandbox with the same name already exists, CreateSandbox treats it
-// as an adopt — useful for resuming a conversation whose actor pod survived
-// an ax-server restart.
+// Blocks until status.sandbox.podIPs[0] is populated or readyTimeout
+// elapses. Creating a raw Sandbox CR with an empty PodSpec fails server
+// admission (`spec.podTemplate.spec.containers: Required value`), so the
+// SandboxClaim path is the only template-driven route.
+//
+// If a SandboxClaim with the same name already exists, CreateSandbox
+// treats it as an adopt — useful for resuming a conversation whose
+// underlying pod survived an ax-server restart.
 func (c *Client) CreateSandbox(ctx context.Context, name string) (*Sandbox, error) {
 	if name == "" {
 		return nil, errors.New("sandbox name is required")
 	}
-	sb := newSandboxObject(name, c.namespace, c.template)
-	if err := c.k8s.Create(ctx, sb); err != nil && !apierrors.IsAlreadyExists(err) {
-		return nil, fmt.Errorf("creating Sandbox %s/%s: %w", c.namespace, name, err)
+	claim := newClaimObject(name, c.namespace, c.template)
+	if err := c.k8s.Create(ctx, claim); err != nil && !apierrors.IsAlreadyExists(err) {
+		return nil, fmt.Errorf("creating SandboxClaim %s/%s: %w", c.namespace, name, err)
 	}
 	return c.waitForReady(ctx, name)
 }
 
-// DeleteSandbox tears down a Sandbox CR. Idempotent — already-gone is OK.
+// DeleteSandbox tears down a SandboxClaim. The agent-sandbox controller
+// garbage-collects the underlying Sandbox CR. Idempotent — already-gone
+// is fine.
 func (c *Client) DeleteSandbox(ctx context.Context, name string) error {
-	sb := &sandboxv1alpha1.Sandbox{
+	claim := &extv1alpha1.SandboxClaim{
 		ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: c.namespace},
 	}
-	if err := c.k8s.Delete(ctx, sb); err != nil && !apierrors.IsNotFound(err) {
-		return fmt.Errorf("deleting Sandbox %s/%s: %w", c.namespace, name, err)
+	if err := c.k8s.Delete(ctx, claim); err != nil && !apierrors.IsNotFound(err) {
+		return fmt.Errorf("deleting SandboxClaim %s/%s: %w", c.namespace, name, err)
 	}
 	return nil
 }
 
-// waitForReady polls the Sandbox CR until podIP is set or the timeout
-// elapses. Returns the populated Sandbox handle on success.
+// waitForReady polls the SandboxClaim until status.sandbox.podIPs has at
+// least one entry, or the timeout elapses. Returns a populated Sandbox
+// handle on success.
 func (c *Client) waitForReady(ctx context.Context, name string) (*Sandbox, error) {
 	deadline := time.Now().Add(c.readyTimeout)
 	for {
-		var got sandboxv1alpha1.Sandbox
+		var got extv1alpha1.SandboxClaim
 		err := c.k8s.Get(ctx, types.NamespacedName{Name: name, Namespace: c.namespace}, &got)
 		if err != nil {
-			return nil, fmt.Errorf("get Sandbox %s/%s: %w", c.namespace, name, err)
+			return nil, fmt.Errorf("get SandboxClaim %s/%s: %w", c.namespace, name, err)
 		}
-		if ips := got.Status.PodIPs; len(ips) > 0 && ips[0] != "" {
+		if ips := got.Status.SandboxStatus.PodIPs; len(ips) > 0 && ips[0] != "" {
 			return &Sandbox{Name: name, Namespace: c.namespace, PodIP: ips[0]}, nil
 		}
 		if time.Now().After(deadline) {
-			return nil, fmt.Errorf("sandbox %s/%s did not become ready within %s", c.namespace, name, c.readyTimeout)
+			return nil, fmt.Errorf("SandboxClaim %s/%s did not become ready within %s", c.namespace, name, c.readyTimeout)
 		}
 		select {
 		case <-ctx.Done():
@@ -184,18 +195,11 @@ func (c *Client) waitForReady(ctx context.Context, name string) (*Sandbox, error
 	}
 }
 
-// newSandboxObject builds the spec for the Sandbox CR we'll create. The
-// only field we set explicitly is the podTemplate's container — everything
-// else defers to the controller's template defaults.
-//
-// TODO: once we wire warm-pool adoption, this likely shifts to creating a
-// SandboxClaim (extensions.agents.x-k8s.io/v1alpha1) referencing a
-// SandboxTemplate, letting the controller adopt from the warmpool when
-// available. For the v1 backend we keep it simple: explicit Sandbox per
-// conversation, container image determined by the template's defaults
-// applied server-side.
-func newSandboxObject(name, namespace, template string) *sandboxv1alpha1.Sandbox {
-	return &sandboxv1alpha1.Sandbox{
+// newClaimObject builds a SandboxClaim CR referencing the configured
+// SandboxTemplate. The controller handles all the actual container
+// spec defaulting + warm pool adoption.
+func newClaimObject(name, namespace, template string) *extv1alpha1.SandboxClaim {
+	return &extv1alpha1.SandboxClaim{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
 			Namespace: namespace,
@@ -204,18 +208,8 @@ func newSandboxObject(name, namespace, template string) *sandboxv1alpha1.Sandbox
 				"ax.google/managed":          "true",
 			},
 		},
-		Spec: sandboxv1alpha1.SandboxSpec{
-			PodTemplate: sandboxv1alpha1.PodTemplate{
-				Spec: corev1.PodSpec{
-					// The actual container spec comes from server-side
-					// defaulting against the named SandboxTemplate via the
-					// agent-sandbox controller. We just leave PodSpec empty
-					// here; if it turns out the controller doesn't default,
-					// we'll switch to a SandboxClaim referencing the
-					// template by name (which IS the documented path for
-					// template-driven creation).
-				},
-			},
+		Spec: extv1alpha1.SandboxClaimSpec{
+			TemplateRef: extv1alpha1.SandboxTemplateRef{Name: template},
 		},
 	}
 }

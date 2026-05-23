@@ -110,7 +110,11 @@ func (s *Server) Connect(req *proto.AgentRequest, stream grpc.ServerStreamingSer
 	if !ok {
 		return errors.New("no user message with text content found")
 	}
-	query := stripBotMention(raw)
+	// Order matters: peel the AX planner's "History Summary:\n…\nPrompt:\n…"
+	// envelope FIRST (when present), then strip any leading bot mention
+	// from the inner prompt. Direct (non-AX) callers skip the first
+	// transform via the helper's no-delimiter fast path.
+	query := stripBotMention(stripAXHistoryEnvelope(raw))
 
 	var body string
 	if query == "" {
@@ -272,6 +276,31 @@ func stripBotMention(s string) string {
 	s = strings.TrimSpace(s)
 	s = botMentionPrefix.ReplaceAllString(s, "")
 	return strings.TrimSpace(s)
+}
+
+// stripAXHistoryEnvelope unwraps the planner-synthesized envelope AX
+// passes to subagents:
+//
+//	History Summary:
+//	<...stringified history...>
+//
+//	Prompt:
+//	<the planner's actual subagent prompt>
+//
+// (see gemini_planner.go ~line 362). The "History Summary:" header is
+// useful context for code-execution agents but is just noise for a
+// search-style agent — Slack's search API would treat the whole envelope
+// as the query string and match against the literal multi-line header.
+//
+// If the trailing "Prompt:\n…" delimiter is present, return everything
+// after it (whitespace-trimmed). Otherwise return s unchanged so direct
+// (non-AX) callers still work.
+func stripAXHistoryEnvelope(s string) string {
+	const delim = "\nPrompt:\n"
+	if i := strings.LastIndex(s, delim); i >= 0 {
+		return strings.TrimSpace(s[i+len(delim):])
+	}
+	return s
 }
 
 // lastUserText returns the text content of the most recent user-role

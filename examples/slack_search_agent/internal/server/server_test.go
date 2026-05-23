@@ -275,6 +275,61 @@ func TestConnect_RejectsMissingStart(t *testing.T) {
 	}
 }
 
+// TestConnect_StripsAXHistoryEnvelope locks in that when AX's planner
+// invokes this subagent with the synthesized
+//
+//	History Summary:
+//	user: <original user prompt>
+//
+//	Prompt:
+//	<subagent prompt arg>
+//
+// envelope (gemini_planner.go ~line 362), we send ONLY the trailing
+// "Prompt:" body to Slack's search.context — not the whole envelope.
+// Otherwise the search query becomes the literal multi-line envelope
+// string and Slack returns garbage / semantic noise.
+//
+// Empirically discovered: a "What is the latest thing Erica said?"
+// turn produced a Slack search query of
+// "History Summary:\nuser: What is the latest thing Erica said?\n\n\nPrompt:\nlatest thing Erica said"
+// which returned older results than what Erica had actually posted
+// most recently.
+func TestConnect_StripsAXHistoryEnvelope(t *testing.T) {
+	fake := &fakeHTTPClient{body: zeroMatchBody}
+	srv := New("xoxp-test", WithHTTPClient(fake))
+	client := newTestClient(t, srv)
+
+	envelope := "History Summary:\nuser: What is the latest thing Erica said?\n\n\nPrompt:\nlatest from Erica"
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{
+			Messages: []*proto.Message{userMessage(envelope)},
+		},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = readAssistantText(t, stream)
+
+	if len(fake.requests) != 1 {
+		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	}
+	body, err := io.ReadAll(fake.requests[0].Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	form, err := url.ParseQuery(string(body))
+	if err != nil {
+		t.Fatalf("parse form: %v", err)
+	}
+	got := form.Get("query")
+	if got != "latest from Erica" {
+		t.Errorf("Slack query = %q, want %q (envelope should be stripped, only the trailing Prompt: body sent)", got, "latest from Erica")
+	}
+	if strings.Contains(got, "History Summary") {
+		t.Errorf("Slack query still contains 'History Summary' header: %q", got)
+	}
+}
+
 func TestConnect_StripsBotMention(t *testing.T) {
 	fake := &fakeHTTPClient{body: zeroMatchBody}
 	srv := New("xoxp-test", WithHTTPClient(fake))

@@ -94,5 +94,15 @@ func NewControllerFromConfig(ctx context.Context, cfg *config.Config) (*controll
 		}
 	}
 
+	// agent-sandbox backend (kubernetes-sigs/agent-sandbox). Parallel to
+	// SubstrateAgents above but targets the GA-stable Sandbox CRDs instead
+	// of Substrate's ate.dev resources, so it works on managed GKE
+	// (Autopilot or Standard) without privileged DaemonSet requirements.
+	for _, agentCfg := range cfg.Registry.AgentSandboxAgents {
+		if err := c.Registry().RegisterAgentSandbox(ctx, agentCfg); err != nil {
+			return nil, fmt.Errorf("failed to register agent-sandbox agent %s: %w", agentCfg.ID, err)
+		}
+	}
+
 	return c, nil
 }

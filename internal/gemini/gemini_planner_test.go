@@ -557,3 +557,62 @@ func TestNewGeminiPlannerAgent_NoSkillsPrompt(t *testing.T) {
 		t.Errorf("expected system prompt to not contain '<available_skills>', got: %s", prompt)
 	}
 }
+
+// TestProcess_AppendsNativeToolsFromConfig asserts that native Gemini
+// tools listed in GeminiConfig.Tools (e.g. "google_search") get added
+// to the GenerateContent request alongside the registered AX subagent
+// function declarations. This is how the planner gets web-grounding
+// without us building a websearch subagent.
+func TestProcess_AppendsNativeToolsFromConfig(t *testing.T) {
+	var captured *genai.GenerateContentConfig
+	mockGen := &mockContentGenerator{
+		generateContentFunc: func(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
+			captured = cfg
+			return &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{{
+					Content: &genai.Content{Parts: []*genai.Part{{Text: "ok"}}},
+				}},
+			}, nil
+		},
+	}
+
+	registry := &mockAgentRegistry{
+		listFunc: func() []string { return nil },
+	}
+
+	p := &geminiPlannerAgent{
+		client:   mockGen,
+		registry: registry,
+		config: GeminiPlannerConfig{
+			GeminiConfig: &config.GeminiConfig{
+				Model:        "test-model",
+				SystemPrompt: "test",
+				Tools:        []string{"google_search"},
+			},
+		},
+	}
+
+	start := &proto.AgentStart{Messages: []*proto.Message{{
+		Role: "user",
+		Content: &proto.Content{
+			Type: &proto.Content_Text{Text: &proto.TextContent{Text: "what is the news"}},
+		},
+	}}}
+	_, _, err := p.process(context.Background(), "conv-native-tools", start, nil, func(o *proto.AgentOutputs) error { return nil })
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+
+	if captured == nil {
+		t.Fatal("GenerateContent was never called")
+	}
+	foundGoogleSearch := false
+	for _, tool := range captured.Tools {
+		if tool != nil && tool.GoogleSearch != nil {
+			foundGoogleSearch = true
+		}
+	}
+	if !foundGoogleSearch {
+		t.Errorf("captured config.Tools does not contain a GoogleSearch entry; got %d tools", len(captured.Tools))
+	}
+}

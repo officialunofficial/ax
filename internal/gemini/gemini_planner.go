@@ -199,6 +199,23 @@ func (p *geminiPlannerAgent) process(ctx context.Context, conversationID string,
 	if err != nil {
 		return "", false, fmt.Errorf("failed to convert agents to tools: %w", err)
 	}
+	// Append any native Gemini tools listed in config (google_search,
+	// url_context, code_execution, …). These coexist with the function
+	// declarations for AX subagents — Gemini decides which to use.
+	for _, t := range p.config.GeminiConfig.Tools {
+		switch t {
+		case "google_search":
+			tools = append(tools, &genai.Tool{GoogleSearch: &genai.GoogleSearch{}})
+		case "url_context":
+			tools = append(tools, &genai.Tool{URLContext: &genai.URLContext{}})
+		case "code_execution":
+			tools = append(tools, &genai.Tool{CodeExecution: &genai.ToolCodeExecution{}})
+		case "google_maps":
+			tools = append(tools, &genai.Tool{GoogleMaps: &genai.GoogleMaps{}})
+		default:
+			return "", false, fmt.Errorf("unsupported native planner tool: %q", t)
+		}
+	}
 
 	inputs := start.Messages
 	if fc, approved := p.handleConfirmationAnswer(inputs); fc != nil {

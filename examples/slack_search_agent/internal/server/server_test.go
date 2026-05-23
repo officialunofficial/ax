@@ -19,10 +19,14 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/url"
+	"net/http/httptest"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/slack-go/slack"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
@@ -30,28 +34,90 @@ import (
 	"github.com/google/ax/proto"
 )
 
-// fakeHTTPClient records requests and returns canned JSON responses.
-type fakeHTTPClient struct {
-	requests []*http.Request
-	body     string
-	status   int
-	err      error
+// fakeSlack is an httptest.Server that pretends to be slack.com. It
+// understands the two endpoints this agent hits — `users.list` and
+// `assistant.search.context` — and records the params of every call so
+// tests can assert on the actual wire-level request body. slack-go's
+// OptionAPIURL points the *slack.Client at this server.
+type fakeSlack struct {
+	srv *httptest.Server
+
+	mu             sync.Mutex
+	usersListCalls int
+	searchCalls    int
+	lastSearch     map[string]string // form values from the most recent search call
+
+	// Configurable response bodies. Defaults are sane (one user, zero
+	// matches) so tests only set what they care about.
+	usersListBody string
+	searchBody    string
 }
 
-func (f *fakeHTTPClient) Do(req *http.Request) (*http.Response, error) {
-	f.requests = append(f.requests, req)
-	if f.err != nil {
-		return nil, f.err
+func newFakeSlack() *fakeSlack {
+	f := &fakeSlack{
+		usersListBody: defaultUsersListBody,
+		searchBody:    zeroMatchBody,
 	}
-	status := f.status
-	if status == 0 {
-		status = 200
+	mux := http.NewServeMux()
+	mux.HandleFunc("/users.list", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.usersListCalls++
+		body := f.usersListBody
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	})
+	mux.HandleFunc("/assistant.search.context", func(w http.ResponseWriter, r *http.Request) {
+		_ = r.ParseForm()
+		f.mu.Lock()
+		f.searchCalls++
+		f.lastSearch = make(map[string]string, len(r.PostForm))
+		for k, v := range r.PostForm {
+			if len(v) > 0 {
+				f.lastSearch[k] = v[0]
+			}
+		}
+		body := f.searchBody
+		f.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, body)
+	})
+	f.srv = httptest.NewServer(mux)
+	return f
+}
+
+func (f *fakeSlack) close() { f.srv.Close() }
+
+// apiURL returns the OptionAPIURL value to pass to slack.New. slack-go
+// builds endpoints as `endpoint + path`, so the trailing slash is required.
+func (f *fakeSlack) apiURL() string { return f.srv.URL + "/" }
+
+func (f *fakeSlack) UsersListCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.usersListCalls
+}
+
+func (f *fakeSlack) SearchCalls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.searchCalls
+}
+
+func (f *fakeSlack) LastSearch() map[string]string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	out := make(map[string]string, len(f.lastSearch))
+	for k, v := range f.lastSearch {
+		out[k] = v
 	}
-	return &http.Response{
-		StatusCode: status,
-		Body:       io.NopCloser(strings.NewReader(f.body)),
-		Header:     make(http.Header),
-	}, nil
+	return out
+}
+
+// newTestServer builds a Server pointed at f. slack-go routes both its
+// search calls and its users.list calls to f via OptionAPIURL.
+func newTestServer(f *fakeSlack) *Server {
+	return New("xoxp-test-token", WithSlackOptions(slack.OptionAPIURL(f.apiURL())))
 }
 
 // newTestClient spins up a Server on bufconn and returns an AgentService
@@ -87,8 +153,8 @@ func userMessage(text string) *proto.Message {
 	}
 }
 
-// readAll consumes the stream and returns the assistant text from the
-// first response message.
+// readAssistantText consumes one stream response and returns the
+// assistant text.
 func readAssistantText(t *testing.T, stream proto.AgentService_ConnectClient) string {
 	t.Helper()
 	resp, err := stream.Recv()
@@ -117,8 +183,7 @@ const twoMatchBody = `{
         "message_ts": "1700000000.000100",
         "content": "we agreed to ship friday",
         "permalink": "https://example.slack.com/archives/C111/p1700000000000100",
-        "is_author_bot": false,
-        "reply_count": 0
+        "is_author_bot": false
       },
       {
         "author_name": "bob",
@@ -128,8 +193,7 @@ const twoMatchBody = `{
         "message_ts": "1700000100.000200",
         "content": "lunch at noon",
         "permalink": "https://example.slack.com/archives/C222/p1700000100000200",
-        "is_author_bot": false,
-        "reply_count": 2
+        "is_author_bot": false
       }
     ],
     "files": [],
@@ -142,10 +206,33 @@ const zeroMatchBody = `{"ok":true,"results":{"messages":[],"files":[],"channels"
 
 const slackErrorBody = `{"ok":false,"error":"invalid_auth"}`
 
+// defaultUsersListBody is a minimal users.list response that any test
+// not specifically exercising user resolution can fall back on. One
+// non-bot user named "Erica Gregor".
+const defaultUsersListBody = `{
+  "ok": true,
+  "members": [
+    {
+      "id": "U06L1HUGDCJ",
+      "name": "erica",
+      "real_name": "Erica Gregor",
+      "deleted": false,
+      "is_bot": false,
+      "profile": {
+        "real_name": "Erica Gregor",
+        "real_name_normalized": "Erica Gregor",
+        "display_name": "erica",
+        "display_name_normalized": "erica"
+      }
+    }
+  ],
+  "response_metadata": {"next_cursor": ""}
+}`
+
 func TestConnect_QueriesSlackWithLatestUserText(t *testing.T) {
-	fake := &fakeHTTPClient{body: zeroMatchBody}
-	srv := New("xoxp-test-token", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
 		Start: &proto.AgentStart{
@@ -160,42 +247,26 @@ func TestConnect_QueriesSlackWithLatestUserText(t *testing.T) {
 	}
 	_ = readAssistantText(t, stream)
 
-	if len(fake.requests) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	if got := f.SearchCalls(); got != 1 {
+		t.Fatalf("expected 1 search call, got %d", got)
 	}
-	req := fake.requests[0]
-	if req.Method != http.MethodPost {
-		t.Errorf("method = %q, want POST", req.Method)
+	form := f.LastSearch()
+	if form["query"] != "project alpha launch" {
+		t.Errorf("query = %q, want %q", form["query"], "project alpha launch")
 	}
-	if req.URL.Host != "slack.com" {
-		t.Errorf("host = %q, want slack.com", req.URL.Host)
-	}
-	if req.URL.Path != "/api/assistant.search.context" {
-		t.Errorf("path = %q, want /api/assistant.search.context", req.URL.Path)
-	}
-	if got := req.Header.Get("Content-Type"); got != "application/x-www-form-urlencoded" {
-		t.Errorf("Content-Type = %q, want application/x-www-form-urlencoded", got)
-	}
-	body, err := io.ReadAll(req.Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		t.Fatalf("parse form: %v", err)
-	}
-	if got := form.Get("query"); got != "project alpha launch" {
-		t.Errorf("form query = %q, want %q", got, "project alpha launch")
-	}
-	if got := req.Header.Get("Authorization"); got != "Bearer xoxp-test-token" {
-		t.Errorf("Authorization = %q, want Bearer xoxp-test-token", got)
+	// slack-go always includes the bearer token in the form body for
+	// assistant.search.context — verify our token survived the slack-go
+	// indirection.
+	if form["token"] != "xoxp-test-token" {
+		t.Errorf("token = %q, want xoxp-test-token", form["token"])
 	}
 }
 
 func TestConnect_FormatsMatches(t *testing.T) {
-	fake := &fakeHTTPClient{body: twoMatchBody}
-	srv := New("xoxp-test", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	f.searchBody = twoMatchBody
+	client := newTestClient(t, newTestServer(f))
 
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
 		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("friday")}},
@@ -224,9 +295,9 @@ func TestConnect_FormatsMatches(t *testing.T) {
 }
 
 func TestConnect_HandlesEmptyResults(t *testing.T) {
-	fake := &fakeHTTPClient{body: zeroMatchBody}
-	srv := New("xoxp-test", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
 		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("zzzz")}},
@@ -245,9 +316,10 @@ func TestConnect_HandlesEmptyResults(t *testing.T) {
 }
 
 func TestConnect_HandlesSlackError(t *testing.T) {
-	fake := &fakeHTTPClient{body: slackErrorBody}
-	srv := New("xoxp-bad", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	f.searchBody = slackErrorBody
+	client := newTestClient(t, newTestServer(f))
 
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
 		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("anything")}},
@@ -263,8 +335,9 @@ func TestConnect_HandlesSlackError(t *testing.T) {
 }
 
 func TestConnect_RejectsMissingStart(t *testing.T) {
-	srv := New("xoxp-test", WithHTTPClient(&fakeHTTPClient{body: zeroMatchBody}))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{})
 	if err != nil {
@@ -275,99 +348,111 @@ func TestConnect_RejectsMissingStart(t *testing.T) {
 	}
 }
 
-// TestConnect_SortsByTimestampDescending locks in that the Slack call
-// requests recency-sorted results (sort=timestamp&sort_dir=desc).
-// Default semantic ranking misses recent short messages — e.g. a query
-// for "latest thing Erica said" returned Erica's substantive May 9-20
-// messages but never surfaced her May 22 "bonjour @Uno" reply because
-// the short greeting ranked low semantically.
-//
-// Recency-first is the right default for an assistant: the LLM consumer
-// gets the 10 most recent matches and can decide which are relevant.
-func TestConnect_SortsByTimestampDescending(t *testing.T) {
-	fake := &fakeHTTPClient{body: zeroMatchBody}
-	srv := New("xoxp-test", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+// TestConnect_RecencyQueryUsesTimestampSort locks in the intent-based
+// sort selection. Queries containing recency keywords ("latest",
+// "recent", etc.) get sort=timestamp; everything else gets the default
+// semantic sort=score.
+func TestConnect_RecencyQueryUsesTimestampSort(t *testing.T) {
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
-		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("anything")}},
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("latest deploy status")}},
 	})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	_ = readAssistantText(t, stream)
 
-	if len(fake.requests) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	form := f.LastSearch()
+	if form["sort"] != "timestamp" {
+		t.Errorf("sort = %q, want timestamp", form["sort"])
 	}
-	body, err := io.ReadAll(fake.requests[0].Body)
+	if form["sort_dir"] != "desc" {
+		t.Errorf("sort_dir = %q, want desc", form["sort_dir"])
+	}
+}
+
+func TestConnect_SemanticQueryUsesScoreSort(t *testing.T) {
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
+
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("decisions about makechain rollout")}},
+	})
 	if err != nil {
-		t.Fatalf("read body: %v", err)
+		t.Fatalf("Connect: %v", err)
 	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		t.Fatalf("parse form: %v", err)
+	_ = readAssistantText(t, stream)
+
+	form := f.LastSearch()
+	if form["sort"] != "score" {
+		t.Errorf("sort = %q, want score", form["sort"])
 	}
-	if got := form.Get("sort"); got != "timestamp" {
-		t.Errorf("sort = %q, want %q", got, "timestamp")
+}
+
+// TestSortForQuery_RecencyTriggersTimestamp covers the keyword
+// detection in isolation — easier to extend than going through the
+// whole gRPC stack for each phrase.
+func TestSortForQuery_RecencyTriggersTimestamp(t *testing.T) {
+	cases := []string{
+		"latest from erica",
+		"newest deploys",
+		"most recent incident",
+		"recent makechain decisions",
+		"what happened today",
+		"yesterday's standup notes",
+		"last week deploys",
+		"LATEST from erica (case-insensitive)",
 	}
-	if got := form.Get("sort_dir"); got != "desc" {
-		t.Errorf("sort_dir = %q, want %q", got, "desc")
+	for _, q := range cases {
+		if got := sortForQuery(q); got != "timestamp" {
+			t.Errorf("sortForQuery(%q) = %q, want timestamp", q, got)
+		}
+	}
+}
+
+func TestSortForQuery_SemanticDefault(t *testing.T) {
+	cases := []string{
+		"what did we decide about deploys",
+		"makechain rollout discussion",
+		"erica thoughts on validator sync",
+		"",
+	}
+	for _, q := range cases {
+		if got := sortForQuery(q); got != "score" {
+			t.Errorf("sortForQuery(%q) = %q, want score", q, got)
+		}
 	}
 }
 
 // TestConnect_StripsAXHistoryEnvelope locks in that when AX's planner
-// invokes this subagent with the synthesized
-//
-//	History Summary:
-//	user: <original user prompt>
-//
-//	Prompt:
-//	<subagent prompt arg>
-//
-// envelope (gemini_planner.go ~line 362), we send ONLY the trailing
-// "Prompt:" body to Slack's search.context — not the whole envelope.
-// Otherwise the search query becomes the literal multi-line envelope
-// string and Slack returns garbage / semantic noise.
-//
-// Empirically discovered: a "What is the latest thing Erica said?"
-// turn produced a Slack search query of
-// "History Summary:\nuser: What is the latest thing Erica said?\n\n\nPrompt:\nlatest thing Erica said"
-// which returned older results than what Erica had actually posted
-// most recently.
+// invokes this subagent with the synthesized History Summary / Prompt
+// envelope (legacy contract), we send ONLY the trailing "Prompt:" body
+// to Slack — not the whole envelope. Otherwise the search query becomes
+// the literal multi-line envelope string and Slack returns garbage.
 func TestConnect_StripsAXHistoryEnvelope(t *testing.T) {
-	fake := &fakeHTTPClient{body: zeroMatchBody}
-	srv := New("xoxp-test", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
-	envelope := "History Summary:\nuser: What is the latest thing Erica said?\n\n\nPrompt:\nlatest from Erica"
+	envelope := "History Summary:\nuser: What is the latest thing Erica said?\n\n\nPrompt:\nrecent decisions"
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
-		Start: &proto.AgentStart{
-			Messages: []*proto.Message{userMessage(envelope)},
-		},
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage(envelope)}},
 	})
 	if err != nil {
 		t.Fatalf("Connect: %v", err)
 	}
 	_ = readAssistantText(t, stream)
 
-	if len(fake.requests) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	form := f.LastSearch()
+	if form["query"] != "recent decisions" {
+		t.Errorf("query = %q, want %q", form["query"], "recent decisions")
 	}
-	body, err := io.ReadAll(fake.requests[0].Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		t.Fatalf("parse form: %v", err)
-	}
-	got := form.Get("query")
-	if got != "latest from Erica" {
-		t.Errorf("Slack query = %q, want %q (envelope should be stripped, only the trailing Prompt: body sent)", got, "latest from Erica")
-	}
-	if strings.Contains(got, "History Summary") {
-		t.Errorf("Slack query still contains 'History Summary' header: %q", got)
+	if strings.Contains(form["query"], "History Summary") {
+		t.Errorf("query still contains 'History Summary': %q", form["query"])
 	}
 }
 
@@ -382,19 +467,19 @@ func TestConnect_StripsAXHistoryEnvelope(t *testing.T) {
 // into messages[0] for backward compatibility, but modern subagents
 // should ignore it when subagent_prompt is set.
 func TestConnect_PrefersStructuredSubagentPrompt(t *testing.T) {
-	fake := &fakeHTTPClient{body: zeroMatchBody}
-	srv := New("xoxp-test", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
 	// Both fields populated (matches what gemini_planner.go writes after
-	// this change). The structured prompt should win — the envelope in
-	// messages[0] is intentionally noisy / different to prove it is
-	// NOT consulted.
+	// the structured-prompt change). The structured prompt should win —
+	// the envelope in messages[0] is intentionally noisy / different to
+	// prove it is NOT consulted.
 	envelope := "History Summary:\nuser: ignore me\n\nPrompt:\nignore me too"
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
 		Start: &proto.AgentStart{
 			Messages:        []*proto.Message{userMessage(envelope)},
-			SubagentPrompt:  "latest from Erica",
+			SubagentPrompt:  "recent decisions",
 			SubagentHistory: "user: What is the latest thing Erica said?",
 		},
 	})
@@ -403,19 +488,9 @@ func TestConnect_PrefersStructuredSubagentPrompt(t *testing.T) {
 	}
 	_ = readAssistantText(t, stream)
 
-	if len(fake.requests) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
-	}
-	body, err := io.ReadAll(fake.requests[0].Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		t.Fatalf("parse form: %v", err)
-	}
-	if got := form.Get("query"); got != "latest from Erica" {
-		t.Errorf("Slack query = %q, want %q (structured subagent_prompt should win)", got, "latest from Erica")
+	form := f.LastSearch()
+	if form["query"] != "recent decisions" {
+		t.Errorf("query = %q, want %q (structured subagent_prompt should win)", form["query"], "recent decisions")
 	}
 }
 
@@ -424,11 +499,11 @@ func TestConnect_PrefersStructuredSubagentPrompt(t *testing.T) {
 // (legacy planner, direct caller, etc.), we still pull the query from
 // messages[0] and strip the legacy envelope.
 func TestConnect_FallsBackToMessagesWhenSubagentPromptEmpty(t *testing.T) {
-	fake := &fakeHTTPClient{body: zeroMatchBody}
-	srv := New("xoxp-test", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
-	envelope := "History Summary:\nuser: What is the latest thing Erica said?\n\nPrompt:\nlatest from Erica"
+	envelope := "History Summary:\nuser: What is the latest thing Erica said?\n\nPrompt:\nrecent decisions"
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
 		Start: &proto.AgentStart{
 			Messages: []*proto.Message{userMessage(envelope)},
@@ -440,32 +515,20 @@ func TestConnect_FallsBackToMessagesWhenSubagentPromptEmpty(t *testing.T) {
 	}
 	_ = readAssistantText(t, stream)
 
-	if len(fake.requests) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
-	}
-	body, err := io.ReadAll(fake.requests[0].Body)
-	if err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	form, err := url.ParseQuery(string(body))
-	if err != nil {
-		t.Fatalf("parse form: %v", err)
-	}
-	if got := form.Get("query"); got != "latest from Erica" {
-		t.Errorf("Slack query = %q, want %q (legacy envelope fallback)", got, "latest from Erica")
+	form := f.LastSearch()
+	if form["query"] != "recent decisions" {
+		t.Errorf("query = %q, want %q (legacy envelope fallback)", form["query"], "recent decisions")
 	}
 }
 
 func TestConnect_StripsBotMention(t *testing.T) {
-	fake := &fakeHTTPClient{body: zeroMatchBody}
-	srv := New("xoxp-test", WithHTTPClient(fake))
-	client := newTestClient(t, srv)
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
 
 	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
 		Start: &proto.AgentStart{
-			Messages: []*proto.Message{
-				userMessage("<@U09R4QH2C4D> what did we say about X"),
-			},
+			Messages: []*proto.Message{userMessage("<@U09R4QH2C4D> what did we say about X")},
 		},
 	})
 	if err != nil {
@@ -473,18 +536,197 @@ func TestConnect_StripsBotMention(t *testing.T) {
 	}
 	_ = readAssistantText(t, stream)
 
-	if len(fake.requests) != 1 {
-		t.Fatalf("expected 1 HTTP call, got %d", len(fake.requests))
+	form := f.LastSearch()
+	if form["query"] != "what did we say about X" {
+		t.Errorf("query = %q, want %q", form["query"], "what did we say about X")
 	}
-	body, err := io.ReadAll(fake.requests[0].Body)
+}
+
+// TestConnect_ResolvesFromName covers the cache-backed user resolver:
+// `from:erica` in the user's prompt becomes `from:<@U06L1HUGDCJ>` in
+// the Slack call (the canonical filter syntax). The default users.list
+// fixture has exactly one Erica, so the rewrite is unambiguous.
+func TestConnect_ResolvesFromName(t *testing.T) {
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
+
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("from:erica latest")}},
+	})
 	if err != nil {
-		t.Fatalf("read body: %v", err)
+		t.Fatalf("Connect: %v", err)
 	}
-	form, err := url.ParseQuery(string(body))
+	_ = readAssistantText(t, stream)
+
+	form := f.LastSearch()
+	if !strings.Contains(form["query"], "from:<@U06L1HUGDCJ>") {
+		t.Errorf("query = %q, want it to contain from:<@U06L1HUGDCJ>", form["query"])
+	}
+	// "latest" survives the rewrite so the sort logic can still pick
+	// it up.
+	if !strings.Contains(form["query"], "latest") {
+		t.Errorf("query = %q, want it to contain 'latest'", form["query"])
+	}
+	if form["sort"] != "timestamp" {
+		t.Errorf("sort = %q, want timestamp (recency keyword present)", form["sort"])
+	}
+}
+
+// TestConnect_ResolvesNaturalLanguageFromName covers the second
+// resolution pass: "from Erica" / "by Erica" (no colon) get rewritten
+// when the name is proper-noun-shaped.
+func TestConnect_ResolvesNaturalLanguageFromName(t *testing.T) {
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
+
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("what did Erica say about deploys")}},
+	})
 	if err != nil {
-		t.Fatalf("parse form: %v", err)
+		t.Fatalf("Connect: %v", err)
 	}
-	if got := form.Get("query"); got != "what did we say about X" {
-		t.Errorf("query = %q, want %q", got, "what did we say about X")
+	_ = readAssistantText(t, stream)
+
+	form := f.LastSearch()
+	if !strings.Contains(form["query"], "from:<@U06L1HUGDCJ>") {
+		t.Errorf("query = %q, want it to contain from:<@U06L1HUGDCJ>", form["query"])
+	}
+}
+
+// TestConnect_LeavesUnresolvableNameUnchanged: an unknown name passes
+// through verbatim. We do NOT make up a user ID, and we do NOT drop
+// the from:filter (the planner can still use it as a plain-text search
+// term).
+func TestConnect_LeavesUnresolvableNameUnchanged(t *testing.T) {
+	f := newFakeSlack()
+	defer f.close()
+	client := newTestClient(t, newTestServer(f))
+
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("from:nonexistent foo")}},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = readAssistantText(t, stream)
+
+	form := f.LastSearch()
+	if form["query"] != "from:nonexistent foo" {
+		t.Errorf("query = %q, want %q", form["query"], "from:nonexistent foo")
+	}
+}
+
+// TestConnect_CachesUserList: two Connect calls in a row with the same
+// resolver should fetch users.list exactly once. The second lookup
+// must hit the in-memory cache.
+func TestConnect_CachesUserList(t *testing.T) {
+	f := newFakeSlack()
+	defer f.close()
+	srv := newTestServer(f)
+	client := newTestClient(t, srv)
+
+	for i := 0; i < 2; i++ {
+		stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+			Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("from:erica anything")}},
+		})
+		if err != nil {
+			t.Fatalf("Connect[%d]: %v", i, err)
+		}
+		_ = readAssistantText(t, stream)
+	}
+
+	if got := f.UsersListCalls(); got != 1 {
+		t.Errorf("users.list calls = %d, want 1 (second Connect should hit cache)", got)
+	}
+	if got := f.SearchCalls(); got != 2 {
+		t.Errorf("search calls = %d, want 2", got)
+	}
+}
+
+// TestConnect_HandlesDuplicateNames: when two users share a first name,
+// resolution is ambiguous → the original token survives, no silent
+// pick. This is the safety property — better to return slightly less
+// relevant results than wrongly attribute messages to the wrong human.
+func TestConnect_HandlesDuplicateNames(t *testing.T) {
+	f := newFakeSlack()
+	defer f.close()
+	f.usersListBody = `{
+      "ok": true,
+      "members": [
+        {
+          "id": "U001",
+          "name": "ericag",
+          "real_name": "Erica Gregor",
+          "deleted": false,
+          "is_bot": false,
+          "profile": {"real_name": "Erica Gregor", "display_name": "ericag"}
+        },
+        {
+          "id": "U002",
+          "name": "ericab",
+          "real_name": "Erica Beck",
+          "deleted": false,
+          "is_bot": false,
+          "profile": {"real_name": "Erica Beck", "display_name": "ericab"}
+        }
+      ],
+      "response_metadata": {"next_cursor": ""}
+    }`
+	client := newTestClient(t, newTestServer(f))
+
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{Messages: []*proto.Message{userMessage("from:erica deploys")}},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = readAssistantText(t, stream)
+
+	form := f.LastSearch()
+	if form["query"] != "from:erica deploys" {
+		t.Errorf("query = %q, want unchanged %q (ambiguous name must NOT be silently resolved)", form["query"], "from:erica deploys")
+	}
+}
+
+// TestUserResolver_CacheRefreshAfterTTL: once the TTL elapses, the next
+// Lookup must re-fetch. This is the eviction half of the cache
+// contract — covered separately from the gRPC tests so we don't have
+// to inflate the wall-clock TTL.
+func TestUserResolver_CacheRefreshAfterTTL(t *testing.T) {
+	var calls int32
+	r := newUserResolver(nil, 10*time.Millisecond)
+	r.fetchFn = func(ctx context.Context) ([]slack.User, error) {
+		atomic.AddInt32(&calls, 1)
+		return []slack.User{{
+			ID:       "U999",
+			Name:     "erica",
+			RealName: "Erica Gregor",
+		}}, nil
+	}
+
+	if _, st := r.Lookup(context.Background(), "erica"); st != lookupFound {
+		t.Fatalf("first Lookup status = %v, want lookupFound", st)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("after first Lookup: fetch calls = %d, want 1", got)
+	}
+
+	// Within TTL → still 1 fetch.
+	if _, st := r.Lookup(context.Background(), "erica"); st != lookupFound {
+		t.Fatalf("cached Lookup status = %v, want lookupFound", st)
+	}
+	if got := atomic.LoadInt32(&calls); got != 1 {
+		t.Fatalf("within TTL: fetch calls = %d, want 1", got)
+	}
+
+	// Past TTL → second fetch.
+	time.Sleep(15 * time.Millisecond)
+	if _, st := r.Lookup(context.Background(), "erica"); st != lookupFound {
+		t.Fatalf("post-TTL Lookup status = %v, want lookupFound", st)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Fatalf("post-TTL: fetch calls = %d, want 2", got)
 	}
 }

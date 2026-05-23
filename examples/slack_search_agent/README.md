@@ -95,6 +95,37 @@ order:
 See [DESIGN.md](./DESIGN.md) for the full migration story and
 backward-compatibility guarantee.
 
+## Query syntax (what the planner can ask for)
+
+The agent passes the prompt straight to Slack's
+`assistant.search.context` after two small rewrites — so the planner
+can use Slack's native search filters in the prompt verbatim and they
+just work.
+
+Filters Slack honors that the planner can include in `prompt`:
+
+| Filter | Example | Effect |
+|---|---|---|
+| `from:<name>` | `from:erica deploys` | Messages authored by the named user. The agent resolves `<name>` (real name, display name, first name, normalized variants) against a 1-hour-cached `users.list` snapshot and rewrites it to Slack's canonical `from:<@USERID>` form. Unresolvable or ambiguous names pass through verbatim. |
+| `from <Name>` / `by <Name>` | `recent commits by Erica` | Same resolution as `from:`, but in natural-language shape. Requires a capitalized name token so common sentences ("hear from the team") aren't munged. |
+| `did <Name> say/post/write/…` | `what did Erica say about deploys` | Same — picks up the "did NAME verb …" shape. |
+| `before:YYYY-MM-DD` | `before:2026-05-01 incident` | Slack-native; passed through. |
+| `after:YYYY-MM-DD` | `after:2026-05-01 incident` | Slack-native; passed through. |
+| `in:#channel` | `in:#deploys friday` | Slack-native; passed through. |
+| `has:link`, `has:reaction:tada`, etc. | `has:link onboarding` | Slack-native; passed through. |
+
+### Recency-aware sort
+
+When the prompt contains any of `latest`, `newest`, `most recent`,
+`recent `, `today`, `yesterday`, or `last week` (case-insensitive), the
+agent picks `sort=timestamp` so the LLM gets the 10 most-recent matches
+rather than Slack's semantic ranking. Otherwise it uses the default
+`sort=score`. The planner can therefore steer ranking with one English
+keyword:
+
+- `recent makechain decisions` — semantic ranking (relevance wins).
+- `latest from:erica` — chronological (most recent first).
+
 ## Smoke test (no K8s)
 
 ```bash
@@ -113,10 +144,14 @@ grpcurl -plaintext \
 ## Tests
 
 ```bash
-go test ./examples/slack_search_agent/...
+go test -race ./examples/slack_search_agent/...
 ```
 
-6 tests covering: query extraction, formatting of multiple matches,
-empty-results, Slack API error passthrough, missing `Start`, and
-bot-mention stripping. A fake `httpClient` is injected via
-`WithHTTPClient` so no real Slack calls happen in CI.
+19 tests covering the gRPC contract, slack-go integration, intent-based
+sort selection (recency vs semantic), `from:`/`from <Name>`/`did <Name>
+say` resolution against a cached `users.list` snapshot (with cache-hit,
+TTL-eviction, and duplicate-name-ambiguity cases), and the two prompt
+ingestion paths (structured `subagent_prompt` and legacy
+`messages[]` envelope). An `httptest.Server` pretending to be slack.com
+is wired up via `slack.OptionAPIURL`, so no real Slack calls happen in
+CI.

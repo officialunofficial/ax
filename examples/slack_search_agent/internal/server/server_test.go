@@ -393,6 +393,32 @@ func TestConnect_SemanticQueryUsesScoreSort(t *testing.T) {
 	}
 }
 
+// TestSearch_StripsRecencyKeywordsFromQuery locks in the lesson from a
+// real smoke: "latest" should drive sort=timestamp AND be removed from
+// the query string. Without the strip, Slack matches messages
+// containing the literal word "latest" (e.g. about Docker :latest
+// tags), missing the user's actual intent.
+func TestSearch_StripsRecencyKeywordsFromQuery(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantSort string
+		wantQ    string
+	}{
+		{"latest from Erica", "timestamp", "from Erica"},
+		{"most recent makechain decisions", "timestamp", "makechain decisions"},
+		{"newest deploy", "timestamp", "deploy"},
+		{"makechain decisions", "score", "makechain decisions"},
+	}
+	for _, tc := range cases {
+		if gotSort := sortForQuery(tc.in); gotSort != tc.wantSort {
+			t.Errorf("sortForQuery(%q) = %q, want %q", tc.in, gotSort, tc.wantSort)
+		}
+		if gotQ := stripRecencyKeywords(tc.in); gotQ != tc.wantQ {
+			t.Errorf("stripRecencyKeywords(%q) = %q, want %q", tc.in, gotQ, tc.wantQ)
+		}
+	}
+}
+
 // TestSortForQuery_RecencyTriggersTimestamp covers the keyword
 // detection in isolation — easier to extend than going through the
 // whole gRPC stack for each phrase.
@@ -448,8 +474,8 @@ func TestConnect_StripsAXHistoryEnvelope(t *testing.T) {
 	_ = readAssistantText(t, stream)
 
 	form := f.LastSearch()
-	if form["query"] != "recent decisions" {
-		t.Errorf("query = %q, want %q", form["query"], "recent decisions")
+	if form["query"] != "decisions" {
+		t.Errorf("query = %q, want %q (recency keyword stripped)", form["query"], "decisions")
 	}
 	if strings.Contains(form["query"], "History Summary") {
 		t.Errorf("query still contains 'History Summary': %q", form["query"])
@@ -489,7 +515,7 @@ func TestConnect_PrefersStructuredSubagentPrompt(t *testing.T) {
 	_ = readAssistantText(t, stream)
 
 	form := f.LastSearch()
-	if form["query"] != "recent decisions" {
+	if form["query"] != "decisions" {
 		t.Errorf("query = %q, want %q (structured subagent_prompt should win)", form["query"], "recent decisions")
 	}
 }
@@ -516,7 +542,7 @@ func TestConnect_FallsBackToMessagesWhenSubagentPromptEmpty(t *testing.T) {
 	_ = readAssistantText(t, stream)
 
 	form := f.LastSearch()
-	if form["query"] != "recent decisions" {
+	if form["query"] != "decisions" {
 		t.Errorf("query = %q, want %q (legacy envelope fallback)", form["query"], "recent decisions")
 	}
 }
@@ -563,13 +589,15 @@ func TestConnect_ResolvesFromName(t *testing.T) {
 	if !strings.Contains(form["query"], "from:<@U06L1HUGDCJ>") {
 		t.Errorf("query = %q, want it to contain from:<@U06L1HUGDCJ>", form["query"])
 	}
-	// "latest" survives the rewrite so the sort logic can still pick
-	// it up.
-	if !strings.Contains(form["query"], "latest") {
-		t.Errorf("query = %q, want it to contain 'latest'", form["query"])
+	// "latest" is consumed for sort detection then STRIPPED from the
+	// query so Slack doesn't match it as a literal keyword (real bug:
+	// "latest" in the query matched messages about Docker :latest
+	// tags). The sort still flips to timestamp.
+	if strings.Contains(form["query"], "latest") {
+		t.Errorf("query = %q; should NOT contain 'latest' after recency-strip", form["query"])
 	}
 	if form["sort"] != "timestamp" {
-		t.Errorf("sort = %q, want timestamp (recency keyword present)", form["sort"])
+		t.Errorf("sort = %q, want timestamp (recency keyword present in original)", form["sort"])
 	}
 }
 

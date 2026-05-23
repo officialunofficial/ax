@@ -194,10 +194,15 @@ func (s *Server) Connect(req *proto.AgentRequest, stream grpc.ServerStreamingSer
 // the caller gets a single human-readable response rather than a gRPC
 // error.
 func (s *Server) search(ctx context.Context, query string) string {
+	// Determine sort from the original query (which still contains
+	// recency keywords), then strip those keywords before sending —
+	// otherwise Slack matches them as literal content.
+	sortMode := sortForQuery(query)
+	apiQuery := stripRecencyKeywords(query)
 	params := slack.AssistantSearchContextParameters{
-		Query:   query,
+		Query:   apiQuery,
 		Limit:   10,
-		Sort:    sortForQuery(query),
+		Sort:    sortMode,
 		SortDir: "desc",
 	}
 	resp, err := s.slack.SearchAssistantContextContext(ctx, params)
@@ -223,6 +228,32 @@ func sortForQuery(q string) string {
 		}
 	}
 	return "score"
+}
+
+// stripRecencyKeywords removes the recency-intent words from the query
+// AFTER sortForQuery has consumed them. Otherwise Slack treats them as
+// literal keywords and matches against message content (e.g. "latest"
+// matched Erica's Docker :latest-tag posts from December 2025).
+//
+// Case-insensitive match; collapses any double spaces left behind.
+func stripRecencyKeywords(q string) string {
+	out := q
+	for _, k := range recencyKeywords {
+		// Replace each occurrence (case-insensitive) with a single space
+		// so we don't accidentally glue adjacent words together.
+		for {
+			i := strings.Index(strings.ToLower(out), k)
+			if i < 0 {
+				break
+			}
+			out = out[:i] + " " + out[i+len(k):]
+		}
+	}
+	// Collapse repeated spaces + trim.
+	for strings.Contains(out, "  ") {
+		out = strings.ReplaceAll(out, "  ", " ")
+	}
+	return strings.TrimSpace(out)
 }
 
 // resolveFromTokens rewrites `from:NAME`, `from NAME`, and `by NAME`

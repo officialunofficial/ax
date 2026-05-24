@@ -694,3 +694,164 @@ func TestProcess_MergesNativeToolsWithFunctionDeclarations(t *testing.T) {
 		t.Errorf("captured.Tools has %d entries; want 1 merged Tool (combining FunctionDeclarations + GoogleSearch on one Tool is required by Gemini docs)", len(captured.Tools))
 	}
 }
+
+// TestProcess_NoToolsWhenRegistryAndNativeBothEmpty guards against Vertex
+// "400 INVALID_ARGUMENT: Tool must contain at least one of
+// function_declarations, google_search, url_context, code_execution".
+// When the agent registry is empty AND no native Gemini tools are
+// configured, process() must not send a zero-valued *genai.Tool to the
+// model — it should send no tools at all (nil or empty).
+//
+// Boot-time / empty-config deployments hit this when the planner runs
+// with no registered subagents and no native tool list.
+func TestProcess_NoToolsWhenRegistryAndNativeBothEmpty(t *testing.T) {
+	var captured *genai.GenerateContentConfig
+	mockGen := &mockContentGenerator{
+		generateContentFunc: func(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
+			captured = cfg
+			return &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{{
+					Content: &genai.Content{Parts: []*genai.Part{{Text: "ok"}}},
+				}},
+			}, nil
+		},
+	}
+
+	registry := &mockAgentRegistry{
+		listFunc: func() []string { return nil },
+	}
+
+	p := &geminiPlannerAgent{
+		client:   mockGen,
+		registry: registry,
+		config: GeminiPlannerConfig{
+			GeminiConfig: &config.GeminiConfig{
+				Model:        "test-model",
+				SystemPrompt: "test",
+				// Tools intentionally empty
+			},
+		},
+	}
+
+	start := &proto.AgentStart{Messages: []*proto.Message{{
+		Role: "user",
+		Content: &proto.Content{
+			Type: &proto.Content_Text{Text: &proto.TextContent{Text: "hi"}},
+		},
+	}}}
+	_, _, err := p.process(context.Background(), "conv-empty", start, nil, func(o *proto.AgentOutputs) error { return nil })
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("GenerateContent was never called")
+	}
+
+	// We must not send a zero-valued *genai.Tool{}. Either nil Tools or
+	// an empty slice is acceptable; a single empty Tool is not.
+	if len(captured.Tools) == 0 {
+		return // nil or empty — good
+	}
+	for i, tool := range captured.Tools {
+		if tool == nil {
+			continue
+		}
+		empty := len(tool.FunctionDeclarations) == 0 &&
+			tool.GoogleSearch == nil &&
+			tool.URLContext == nil &&
+			tool.CodeExecution == nil &&
+			tool.GoogleMaps == nil
+		if empty {
+			t.Errorf("captured.Tools[%d] is a zero-valued *genai.Tool; Vertex will reject this with 400 INVALID_ARGUMENT", i)
+		}
+	}
+}
+
+// fakeNativeTool is a minimal Tool stub that lets tests inject a Tool
+// carrying native Gemini fields (GoogleSearch, URLContext, etc.) into
+// the agentsToTools nativeTools variadic and, through it, the process()
+// merge loop.
+type fakeNativeTool struct {
+	name  string
+	tools []*genai.Tool
+}
+
+func (f *fakeNativeTool) Name() string            { return f.name }
+func (f *fakeNativeTool) FuncDecl() []*genai.Tool { return f.tools }
+func (f *fakeNativeTool) SystemPrompt() string    { return "" }
+func (f *fakeNativeTool) HandleCall(ctx context.Context, fc *genai.FunctionCall, o agent.OutputHandler) error {
+	return nil
+}
+func (f *fakeNativeTool) HandleExecute(ctx context.Context, fc *genai.FunctionCall, approved bool, o agent.OutputHandler) error {
+	return nil
+}
+
+// TestProcess_MergePreservesNativeFieldsFromRawTools guards against a
+// latent bug in the process() merge loop: when agentsToTools' nativeTools
+// variadic produces a *genai.Tool with native fields set
+// (GoogleSearch / URLContext / CodeExecution / GoogleMaps), the merge
+// loop must copy those fields onto mergedTool — not just
+// FunctionDeclarations.
+//
+// No current caller plumbs nativeTools into agentsToTools, so this is a
+// latent bug, but future callers would silently lose native tools.
+func TestProcess_MergePreservesNativeFieldsFromRawTools(t *testing.T) {
+	var captured *genai.GenerateContentConfig
+	mockGen := &mockContentGenerator{
+		generateContentFunc: func(ctx context.Context, model string, contents []*genai.Content, cfg *genai.GenerateContentConfig) (*genai.GenerateContentResponse, error) {
+			captured = cfg
+			return &genai.GenerateContentResponse{
+				Candidates: []*genai.Candidate{{
+					Content: &genai.Content{Parts: []*genai.Part{{Text: "ok"}}},
+				}},
+			}, nil
+		},
+	}
+
+	registry := &mockAgentRegistry{
+		listFunc: func() []string { return nil },
+	}
+
+	// nativeTool emits a *genai.Tool with GoogleSearch set (the kind of
+	// shape future callers of agentsToTools(registry, nativeTools…)
+	// could pass in).
+	nativeTool := &fakeNativeTool{
+		name: "fake_native",
+		tools: []*genai.Tool{{
+			GoogleSearch: &genai.GoogleSearch{},
+		}},
+	}
+
+	p := &geminiPlannerAgent{
+		client:      mockGen,
+		registry:    registry,
+		nativeTools: []Tool{nativeTool},
+		config: GeminiPlannerConfig{
+			GeminiConfig: &config.GeminiConfig{
+				Model:        "test-model",
+				SystemPrompt: "test",
+			},
+		},
+	}
+
+	start := &proto.AgentStart{Messages: []*proto.Message{{
+		Role: "user",
+		Content: &proto.Content{
+			Type: &proto.Content_Text{Text: &proto.TextContent{Text: "hi"}},
+		},
+	}}}
+	_, _, err := p.process(context.Background(), "conv-native-merge", start, nil, func(o *proto.AgentOutputs) error { return nil })
+	if err != nil {
+		t.Fatalf("process: %v", err)
+	}
+	if captured == nil {
+		t.Fatal("GenerateContent was never called")
+	}
+
+	if len(captured.Tools) == 0 {
+		t.Fatal("captured.Tools is empty; expected a Tool carrying GoogleSearch")
+	}
+	if captured.Tools[0].GoogleSearch == nil {
+		t.Errorf("merged Tool dropped GoogleSearch from raw native tool; merge loop only copied FunctionDeclarations")
+	}
+}

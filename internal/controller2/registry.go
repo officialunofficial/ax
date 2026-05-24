@@ -32,6 +32,11 @@ type Registry struct {
 	mu        sync.RWMutex
 	agents    map[string]agent.Agent
 	agentInfo map[string]*agent.AgentInfo
+
+	// agentSandboxFactory is set by SetAgentSandboxClientFactory (test-only)
+	// to override the default kube-in-cluster client construction used by
+	// RegisterAgentSandbox.
+	agentSandboxFactory agentSandboxClientFactory
 }
 
 // NewRegistry creates a new agent registry.

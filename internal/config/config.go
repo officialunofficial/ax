@@ -36,9 +36,10 @@ type Config struct {
 
 // RegistryConfig allows registring agents.
 type RegistryConfig struct {
-	RemoteAgents    []RemoteAgentConfig    `yaml:"remote_agents,omitempty"`
-	ColabAgents     []ColabAgentConfig     `yaml:"colab_agents,omitempty"`
-	SubstrateAgents []SubstrateAgentConfig `yaml:"substrate_agents,omitempty"`
+	RemoteAgents       []RemoteAgentConfig       `yaml:"remote_agents,omitempty"`
+	ColabAgents        []ColabAgentConfig        `yaml:"colab_agents,omitempty"`
+	SubstrateAgents    []SubstrateAgentConfig    `yaml:"substrate_agents,omitempty"`
+	AgentSandboxAgents []AgentSandboxAgentConfig `yaml:"agent_sandbox_agents,omitempty"`
 }
 
 // ATEConfig configures the ATE integration.
@@ -110,6 +111,25 @@ type SubstrateAgentConfig struct {
 	Headers     auth.Headers      `yaml:"headers,omitempty"`  // Optional headers
 	Metadata    map[string]string `yaml:"metadata,omitempty"` // Optional metadata
 	// TODO(jbd): Rename this struct before releasing.
+}
+
+// AgentSandboxAgentConfig allows registering a new agent backed by a
+// kubernetes-sigs/agent-sandbox Sandbox CR. Mirrors SubstrateAgentConfig
+// but targets the GA agent-sandbox API (agents.x-k8s.io/v1alpha1) instead
+// of Substrate's ate.dev/v1alpha1 resources. Picks up working on managed
+// GKE (Autopilot or Standard) where Substrate's privileged DaemonSet is
+// rejected.
+type AgentSandboxAgentConfig struct {
+	ID          string            `yaml:"id"`                 // Unique agent identifier
+	Name        string            `yaml:"name"`               // Human-readable name
+	Description string            `yaml:"description"`        // Description of agent capabilities
+	Port        int               `yaml:"port"`               // AgentService gRPC port inside the sandbox pod (default 8494)
+	Namespace   string            `yaml:"namespace"`          // K8s namespace where Sandbox CRs are created
+	Template    string            `yaml:"template"`           // SandboxTemplate name (extensions.agents.x-k8s.io/v1alpha1)
+	Protocol    string            `yaml:"protocol,omitempty"` // "axp" (default) or "a2a"
+	Auth        auth.Auth         `yaml:"auth,omitempty"`     // Optional auth
+	Headers     auth.Headers      `yaml:"headers,omitempty"`  // Optional headers
+	Metadata    map[string]string `yaml:"metadata,omitempty"` // Optional metadata
 }
 
 // RemoteAgentConfig configures a remote agent to register on startup.

@@ -32,6 +32,11 @@ type Registry struct {
 	mu        sync.RWMutex
 	agents    map[string]agent.Agent
 	agentInfo map[string]*agent.AgentInfo
+
+	// agentSandboxFactory overrides the default in-cluster client factory
+	// used by RegisterAgentSandbox. Set via SetAgentSandboxClientFactory
+	// (tests only).
+	agentSandboxFactory agentSandboxClientFactory
 }
 
 // NewRegistry creates a new agent registry.

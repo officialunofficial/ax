@@ -1,0 +1,32 @@
+# Build the websearch_agent image. Context must be the AX repo root
+# so the Dockerfile can `COPY . .` to access the proto + go.mod.
+#
+# Run from the repo root:
+#   gcloud builds submit --config=examples/websearch_agent/cloudbuild.yaml \
+#                        --substitutions=_TAG=$(git rev-parse --short HEAD) .
+
+substitutions:
+  _TAG: manual
+
+steps:
+  - id: build
+    name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - --file=examples/websearch_agent/Dockerfile
+      - --tag=us-east4-docker.pkg.dev/official-unofficial/docker/websearch-agent:${_TAG}
+      - --tag=us-east4-docker.pkg.dev/official-unofficial/docker/websearch-agent:latest
+      - .
+  - id: push-tag
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-east4-docker.pkg.dev/official-unofficial/docker/websearch-agent:${_TAG}
+  - id: push-latest
+    name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - us-east4-docker.pkg.dev/official-unofficial/docker/websearch-agent:latest
+
+options:
+  logging: CLOUD_LOGGING_ONLY

@@ -194,11 +194,13 @@ func (s *Server) Connect(req *proto.AgentRequest, stream grpc.ServerStreamingSer
 // the caller gets a single human-readable response rather than a gRPC
 // error.
 func (s *Server) search(ctx context.Context, query string) string {
-	// Determine sort from the original query (which still contains
-	// recency keywords), then strip those keywords before sending —
-	// otherwise Slack matches them as literal content.
+	// Decide sort from the original query (which still contains the
+	// recency keyword), then prepare the API query via finalizeQuery
+	// which (a) strips recency keywords and (b) when sort=timestamp +
+	// a Slack filter is present, drops free-text content so the filter
+	// + recency rank determine the result set on their own.
 	sortMode := sortForQuery(query)
-	apiQuery := stripRecencyKeywords(query)
+	apiQuery := finalizeQuery(query)
 	params := slack.AssistantSearchContextParameters{
 		Query:   apiQuery,
 		Limit:   10,
@@ -228,6 +230,44 @@ func sortForQuery(q string) string {
 		}
 	}
 	return "score"
+}
+
+// slackFilterToken matches a single Slack search filter token like
+// `from:<@U12345>`, `in:<#C123>`, `has:link`, `before:2026-05-01`,
+// `after:2026-01-01`. The leading word (the filter name) is followed
+// by a colon and a non-space value.
+var slackFilterToken = regexp.MustCompile(`^[a-zA-Z_]+:\S+$`)
+
+// finalizeQuery prepares the API query string. Two transforms:
+//
+//  1. stripRecencyKeywords (always) — remove "latest"/"newest"/etc. so
+//     they don't match as literal content.
+//  2. If the result now contains a Slack filter token AND sort=timestamp
+//     would fire on the original query, drop ALL non-filter tokens —
+//     the user is asking for "recent things from X", not "recent things
+//     from X also containing keyword Y" (verified: literal content
+//     words exclude valid matches).
+//
+// Idempotent. Safe to call on already-clean queries.
+func finalizeQuery(q string) string {
+	wantRecency := sortForQuery(q) == "timestamp"
+	stripped := stripRecencyKeywords(q)
+	if !wantRecency {
+		return stripped
+	}
+	tokens := strings.Fields(stripped)
+	var filters []string
+	for _, t := range tokens {
+		if slackFilterToken.MatchString(t) {
+			filters = append(filters, t)
+		}
+	}
+	if len(filters) == 0 {
+		// No filters present — content tokens are the only signal we
+		// have. Keep them; sort=timestamp will still bias to recent.
+		return stripped
+	}
+	return strings.Join(filters, " ")
 }
 
 // stripRecencyKeywords removes the recency-intent words from the query

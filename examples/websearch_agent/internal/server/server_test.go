@@ -17,10 +17,12 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"google.golang.org/genai"
 	"google.golang.org/grpc"
@@ -152,6 +154,43 @@ func readAssistantText(t *testing.T, stream proto.AgentService_ConnectClient) st
 
 // TestConnect_SendsGoogleSearchToolOnly is the load-bearing assertion:
 // the websearch agent MUST call Gemini with exactly one Tool entry, that
+// TestConnect_GroundsAnswerInCurrentDate locks in the fix for a real
+// smoke: Gemini's GoogleSearch returned old web content (October 2024
+// Anthropic releases) and the bot wrote "Anthropic has had a very busy
+// October 2024" — stale content presented as current. Separately for a
+// weather query the bot invented a date "today is May 24, 2026" when
+// the actual day was May 23.
+//
+// Fix: pass today's date in the SystemInstruction so Gemini grounds the
+// answer in the present and doesn't quote stale content as recent.
+func TestConnect_GroundsAnswerInCurrentDate(t *testing.T) {
+	fg := &fakeGenai{resp: textOnlyResponse("ok")}
+	client := newTestClient(t, newTestServer(fg, "gemini-3-flash-preview"))
+	stream, err := client.Connect(context.Background(), &proto.AgentRequest{
+		Start: &proto.AgentStart{SubagentPrompt: "anything"},
+	})
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	_ = readAssistantText(t, stream)
+
+	_, _, cfg, _ := fg.snapshot()
+	if cfg == nil || cfg.SystemInstruction == nil {
+		t.Fatal("expected a SystemInstruction (needed so Gemini grounds in today's date)")
+	}
+	var combined string
+	for _, p := range cfg.SystemInstruction.Parts {
+		combined += p.Text
+	}
+	year := fmt.Sprintf("%d", time.Now().UTC().Year())
+	if !strings.Contains(combined, year) {
+		t.Errorf("SystemInstruction = %q; expected current year %q so Gemini grounds in the present", combined, year)
+	}
+	if !strings.Contains(strings.ToLower(combined), "today") {
+		t.Errorf("SystemInstruction = %q; expected a 'today' hint so Gemini doesn't quote old content as recent", combined)
+	}
+}
+
 // Tool's GoogleSearch MUST be set, and NO FunctionDeclarations may be
 // attached. Mixing the two trips Vertex's "Multiple tools are supported
 // only when they are all search tools" 400 (verified live).

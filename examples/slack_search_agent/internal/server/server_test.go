@@ -393,6 +393,43 @@ func TestConnect_SemanticQueryUsesScoreSort(t *testing.T) {
 	}
 }
 
+// TestSearch_DropsContentWhenFilterPlusTimestampSort locks in the lesson
+// from a real smoke: planner sent "latest message from Erica". Agent
+// (a) resolved "from Erica" → "from:<@U…>" and (b) stripped "latest"
+// so sort flipped to timestamp. BUT "message" survived as a literal
+// Slack content filter, and Erica's actual most-recent reply ("bonjour
+// Uno") doesn't contain "message" — so the search excluded it.
+//
+// Fix: when sort=timestamp is active AND any Slack filter token
+// (from:/in:/has:/etc.) is present, keep ONLY the filters. The user
+// asked for "recent things from X", not "recent things from X also
+// containing keyword Y".
+func TestSearch_DropsContentWhenFilterPlusTimestampSort(t *testing.T) {
+	cases := []struct {
+		in       string
+		wantSort string
+		wantQ    string
+	}{
+		// The exact bug case.
+		{"latest message from:<@U06L1HUGDCJ>", "timestamp", "from:<@U06L1HUGDCJ>"},
+		// Multiple filters + content + recency.
+		{"recent updates in:<#C123> from:<@U06L1HUGDCJ>", "timestamp", "in:<#C123> from:<@U06L1HUGDCJ>"},
+		// No filter: keep content (it's the only signal).
+		{"newest deploy", "timestamp", "deploy"},
+		// No recency: keep everything as-is (semantic search benefits
+		// from content keywords).
+		{"message from:<@U06L1HUGDCJ>", "score", "message from:<@U06L1HUGDCJ>"},
+	}
+	for _, tc := range cases {
+		if gotSort := sortForQuery(tc.in); gotSort != tc.wantSort {
+			t.Errorf("sortForQuery(%q) = %q, want %q", tc.in, gotSort, tc.wantSort)
+		}
+		if gotQ := finalizeQuery(tc.in); gotQ != tc.wantQ {
+			t.Errorf("finalizeQuery(%q) = %q, want %q", tc.in, gotQ, tc.wantQ)
+		}
+	}
+}
+
 // TestSearch_StripsRecencyKeywordsFromQuery locks in the lesson from a
 // real smoke: "latest" should drive sort=timestamp AND be removed from
 // the query string. Without the strip, Slack matches messages

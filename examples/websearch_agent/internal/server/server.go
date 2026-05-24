@@ -31,6 +31,7 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"google.golang.org/genai"
 	"google.golang.org/grpc"
@@ -69,6 +70,9 @@ type Server struct {
 
 	client genaiClient
 	model  string
+	// now is the wall-clock source for "today" in the SystemInstruction.
+	// Defaults to time.Now; tests can stub it.
+	now func() time.Time
 }
 
 // New builds a Server backed by a real *genai.Client constructed via
@@ -93,14 +97,14 @@ func New(ctx context.Context, project, location, model string) (*Server, error) 
 	if err != nil {
 		return nil, fmt.Errorf("create genai client: %w", err)
 	}
-	return &Server{client: &realClient{client: client}, model: model}, nil
+	return &Server{client: &realClient{client: client}, model: model, now: time.Now}, nil
 }
 
 // NewWithClient is the test constructor: it skips genai.NewClient and
 // takes an already-built genaiClient. Used by server_test.go to inject
 // a fakeGenai.
 func NewWithClient(client genaiClient, model string) *Server {
-	return &Server{client: client, model: model}
+	return &Server{client: client, model: model, now: time.Now}
 }
 
 // Connect implements proto.AgentService. Single-turn: read the query
@@ -162,6 +166,12 @@ func (s *Server) search(ctx context.Context, query string) string {
 		return "Please provide a search query."
 	}
 
+	// Ground Gemini in the present so it doesn't quote stale web
+	// content as if it were current. Without this hint, Gemini's
+	// GoogleSearch happily returns October 2024 press releases for an
+	// "Anthropic news" query and the synthesis writes "Anthropic has
+	// had a busy October 2024 …" — verified empirically.
+	today := s.now().UTC().Format("Monday, January 2, 2006")
 	cfg := &genai.GenerateContentConfig{
 		// EXACTLY one Tool, with GoogleSearch set and NO
 		// FunctionDeclarations. Vertex rejects mixed tool kinds in the
@@ -171,6 +181,15 @@ func (s *Server) search(ctx context.Context, query string) string {
 		Tools: []*genai.Tool{{
 			GoogleSearch: &genai.GoogleSearch{},
 		}},
+		SystemInstruction: &genai.Content{
+			Parts: []*genai.Part{{Text: fmt.Sprintf(
+				"Today is %s. When answering from search results, ground "+
+					"in this date. Prefer the most recent sources. Do NOT "+
+					"refer to past events as 'recent' or 'today' if their "+
+					"publication date is older than the current month.",
+				today,
+			)}},
+		},
 	}
 
 	resp, err := s.client.GenerateContent(ctx, s.model, genai.Text(query), cfg)

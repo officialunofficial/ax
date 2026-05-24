@@ -61,13 +61,23 @@ var fromPattern = regexp.MustCompile(`(?i)\bfrom:([a-z][a-z0-9._-]*)\b`)
 // We require a capitalized name for these shapes so we don't munge
 // sentences like "what did we hear from the team about deploys" —
 // only proper-noun-shaped tokens get resolved.
-var byNamePattern = regexp.MustCompile(`(?i)\b(from|by)\s+([A-Z][a-z][A-Za-z0-9._-]*)\b`)
+//
+// IMPORTANT: do NOT use the (?i) flag here. In Go's RE2 syntax (?i)
+// makes character classes case-insensitive too, so [A-Z] would match
+// lowercase letters and the proper-noun guard would be a lie ("from
+// the team" would capture "the"). Instead we enumerate the trigger
+// word's case variants explicitly.
+var byNamePattern = regexp.MustCompile(`\b(?:from|by|From|By|FROM|BY)\s+([A-Z][a-z][A-Za-z0-9._-]*)\b`)
 
 // didNamePattern picks up the "what did NAME say/think/post …" shape.
 // We require a following verb-shaped token so "did NAME" alone (rare
 // in real prompts) doesn't false-positive. The verb list is short and
 // obvious — same rationale as recencyKeywords.
-var didNamePattern = regexp.MustCompile(`(?i)\bdid\s+([A-Z][a-z][A-Za-z0-9._-]*)\s+(say|said|post|posted|write|wrote|mention|think|share|shared)\b`)
+//
+// Same (?i) caveat as byNamePattern: enumerate the trigger word's
+// case variants instead of using the flag. The verb list stays
+// lowercase since real prompts overwhelmingly use lowercase verbs.
+var didNamePattern = regexp.MustCompile(`\b(?:did|Did|DID)\s+([A-Z][a-z][A-Za-z0-9._-]*)\s+(say|said|post|posted|write|wrote|mention|think|share|shared)\b`)
 
 // recencyKeywords trigger `sort=timestamp` instead of Slack's default
 // semantic ranking. Keep this list short and obvious — anything else
@@ -80,6 +90,26 @@ var recencyKeywords = []string{
 	"today",
 	"yesterday",
 	"last week",
+}
+
+// fillerNouns are paraphrase artifacts the planner sprinkles into
+// queries that, when treated as Slack content filters, exclude
+// otherwise-valid messages. "message" / "post" / "updates" are the
+// repeat offenders observed in production. Stripped in finalizeQuery
+// regardless of sort mode — they're never the user's real intent.
+//
+// Keep this list short and obvious for the same reason as
+// recencyKeywords: anything fancier belongs in a real classifier.
+var fillerNouns = []string{
+	"messages",
+	"message",
+	"things",
+	"thing",
+	"posts",
+	"post",
+	"updates",
+	"update",
+	"anything",
 }
 
 // Server is the AgentService implementation. Each Connect RPC takes the
@@ -232,42 +262,62 @@ func sortForQuery(q string) string {
 	return "score"
 }
 
-// slackFilterToken matches a single Slack search filter token like
-// `from:<@U12345>`, `in:<#C123>`, `has:link`, `before:2026-05-01`,
-// `after:2026-01-01`. The leading word (the filter name) is followed
-// by a colon and a non-space value.
-var slackFilterToken = regexp.MustCompile(`^[a-zA-Z_]+:\S+$`)
-
-// finalizeQuery prepares the API query string. Two transforms:
+// finalizeQuery prepares the API query string. Two transforms,
+// applied unconditionally:
 //
-//  1. stripRecencyKeywords (always) — remove "latest"/"newest"/etc. so
-//     they don't match as literal content.
-//  2. If the result now contains a Slack filter token AND sort=timestamp
-//     would fire on the original query, drop ALL non-filter tokens —
-//     the user is asking for "recent things from X", not "recent things
-//     from X also containing keyword Y" (verified: literal content
-//     words exclude valid matches).
+//  1. stripRecencyKeywords — remove "latest"/"newest"/etc. so they
+//     don't match as literal content (sortForQuery already consumed
+//     the intent signal).
+//  2. stripFillerNouns — remove paraphrase-artifact nouns like
+//     "message", "updates", "post" that aren't the user's real
+//     intent but, when treated as Slack content filters, exclude
+//     otherwise-valid messages.
+//
+// We intentionally do NOT drop other content tokens. An earlier
+// version stripped EVERYTHING non-filter when sort=timestamp + any
+// filter was present, which destroyed legitimate scope like
+// "latest from:erica kubernetes upgrade" → "from:erica". Filler
+// stripping is the narrowest fix that addresses the original bug
+// without erasing real intent.
 //
 // Idempotent. Safe to call on already-clean queries.
 func finalizeQuery(q string) string {
-	wantRecency := sortForQuery(q) == "timestamp"
 	stripped := stripRecencyKeywords(q)
-	if !wantRecency {
-		return stripped
+	stripped = stripFillerNouns(stripped)
+	return stripped
+}
+
+// stripFillerNouns removes paraphrase-artifact tokens like "message"
+// and "updates" that aren't user intent but, when sent to Slack as
+// content keywords, exclude otherwise-valid messages.
+//
+// Token-level (whole-word) match rather than substring — we must not
+// eat the "post" inside "postmortem" or the "update" inside
+// "updated-deploy-doc". Slack filter tokens (from:/in:/etc.) are
+// preserved verbatim because they contain a colon and never appear
+// in fillerNouns.
+//
+// Case-insensitive.
+func stripFillerNouns(q string) string {
+	tokens := strings.Fields(q)
+	if len(tokens) == 0 {
+		return q
 	}
-	tokens := strings.Fields(stripped)
-	var filters []string
-	for _, t := range tokens {
-		if slackFilterToken.MatchString(t) {
-			filters = append(filters, t)
+	out := tokens[:0]
+	for _, tok := range tokens {
+		lower := strings.ToLower(tok)
+		drop := false
+		for _, f := range fillerNouns {
+			if lower == f {
+				drop = true
+				break
+			}
+		}
+		if !drop {
+			out = append(out, tok)
 		}
 	}
-	if len(filters) == 0 {
-		// No filters present — content tokens are the only signal we
-		// have. Keep them; sort=timestamp will still bias to recent.
-		return stripped
-	}
-	return strings.Join(filters, " ")
+	return strings.Join(out, " ")
 }
 
 // stripRecencyKeywords removes the recency-intent words from the query
@@ -418,15 +468,19 @@ func humanTS(ts string) string {
 	return time.Unix(sec, 0).UTC().Format("2006-01-02 15:04:05 UTC")
 }
 
-// truncate clips s to max runes with a trailing ellipsis.
+// truncate clips s to max runes with a trailing ellipsis. Operating on
+// runes rather than bytes is required: a byte-level slice can split a
+// multi-byte UTF-8 sequence (em-dash, emoji, accented chars) mid-byte
+// and produce invalid UTF-8 that breaks downstream JSON encoders.
 func truncate(s string, max int) string {
-	if len(s) <= max {
+	r := []rune(s)
+	if len(r) <= max {
 		return s
 	}
 	if max <= 1 {
-		return s[:max]
+		return string(r[:max])
 	}
-	return s[:max-1] + "…"
+	return string(r[:max-1]) + "…"
 }
 
 // stripBotMention removes a leading "<@Uxxxx>" prefix and trims whitespace.

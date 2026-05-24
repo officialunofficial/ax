@@ -25,6 +25,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/slack-go/slack"
 	"google.golang.org/grpc"
@@ -393,32 +394,35 @@ func TestConnect_SemanticQueryUsesScoreSort(t *testing.T) {
 	}
 }
 
-// TestSearch_DropsContentWhenFilterPlusTimestampSort locks in the lesson
-// from a real smoke: planner sent "latest message from Erica". Agent
-// (a) resolved "from Erica" → "from:<@U…>" and (b) stripped "latest"
-// so sort flipped to timestamp. BUT "message" survived as a literal
-// Slack content filter, and Erica's actual most-recent reply ("bonjour
-// Uno") doesn't contain "message" — so the search excluded it.
+// TestFinalizeQuery_StripsFillerNotMeaningfulContent locks in the
+// refined behavior: filler nouns ("message", "updates", "thing", …)
+// get stripped because they're paraphrase artifacts from the planner,
+// but real content scope ("kubernetes upgrade", "deploy") stays —
+// dropping it discards legitimate user intent.
 //
-// Fix: when sort=timestamp is active AND any Slack filter token
-// (from:/in:/has:/etc.) is present, keep ONLY the filters. The user
-// asked for "recent things from X", not "recent things from X also
-// containing keyword Y".
-func TestSearch_DropsContentWhenFilterPlusTimestampSort(t *testing.T) {
+// History: the original fix dropped ALL non-filter tokens when
+// sort=timestamp + any filter was present. That over-fired and
+// erased queries like "latest from:erica kubernetes upgrade" down
+// to just "from:erica", losing the kubernetes scope. The refined
+// design strips a short filler list only.
+func TestFinalizeQuery_StripsFillerNotMeaningfulContent(t *testing.T) {
 	cases := []struct {
 		in       string
 		wantSort string
 		wantQ    string
 	}{
-		// The exact bug case.
+		// The original bug case: "message" is filler, so it goes,
+		// and the from: filter remains.
 		{"latest message from:<@U06L1HUGDCJ>", "timestamp", "from:<@U06L1HUGDCJ>"},
-		// Multiple filters + content + recency.
-		{"recent updates in:<#C123> from:<@U06L1HUGDCJ>", "timestamp", "in:<#C123> from:<@U06L1HUGDCJ>"},
-		// No filter: keep content (it's the only signal).
+		// "kubernetes upgrade" is legitimate content scope — keep it.
+		{"latest from:<@U06L1HUGDCJ> kubernetes upgrade", "timestamp", "from:<@U06L1HUGDCJ> kubernetes upgrade"},
+		// "updates" is filler.
+		{"recent updates in:<#C123>", "timestamp", "in:<#C123>"},
+		// No recency: still strip filler so semantic search sees the
+		// real signal (the from: filter), not paraphrase noise.
+		{"message from:<@U06L1HUGDCJ>", "score", "from:<@U06L1HUGDCJ>"},
+		// No filter, no filler: leave the only signal alone.
 		{"newest deploy", "timestamp", "deploy"},
-		// No recency: keep everything as-is (semantic search benefits
-		// from content keywords).
-		{"message from:<@U06L1HUGDCJ>", "score", "message from:<@U06L1HUGDCJ>"},
 	}
 	for _, tc := range cases {
 		if gotSort := sortForQuery(tc.in); gotSort != tc.wantSort {
@@ -793,5 +797,105 @@ func TestUserResolver_CacheRefreshAfterTTL(t *testing.T) {
 	}
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Fatalf("post-TTL: fetch calls = %d, want 2", got)
+	}
+}
+
+// TestByNamePattern_RequiresProperNoun locks in that the
+// from/by NAME regex only fires on a capitalized name, not on
+// articles or filler nouns. The earlier `(?i)` flag made the
+// character class `[A-Z]` match lowercase too, so "from the team"
+// matched (capturing "the") and the proper-noun guard in the
+// comment was a lie. Go RE2 applies (?i) to character classes
+// as well — confirmed by https://pkg.go.dev/regexp/syntax.
+func TestByNamePattern_RequiresProperNoun(t *testing.T) {
+	mustNotMatch := []string{
+		"what did we hear from the team about deploys",
+		"any news by the team",
+		"from the engineers",
+		"by my manager",
+	}
+	for _, in := range mustNotMatch {
+		if byNamePattern.MatchString(in) {
+			t.Errorf("byNamePattern matched %q, want no match (lowercase noun)", in)
+		}
+	}
+	mustMatch := []string{
+		"from Erica",
+		"by Erica",
+		"FROM Erica",
+		"By Erica",
+		"updates from Erica yesterday",
+	}
+	for _, in := range mustMatch {
+		if !byNamePattern.MatchString(in) {
+			t.Errorf("byNamePattern did not match %q, want match (proper noun)", in)
+		}
+	}
+}
+
+// TestDidNamePattern_RequiresProperNoun is the same guard for the
+// "did NAME say/post/…" shape. Most lowercase-after-did phrases are
+// already deflected by the trailing verb constraint, but the (?i)
+// flag still lets "did the post say" through (captures "the", verb
+// "post"). The proper-noun-only fix kills that path.
+func TestDidNamePattern_RequiresProperNoun(t *testing.T) {
+	mustNotMatch := []string{
+		"what did the boss say about deploys",
+		"did the team post the update",
+		"did our manager mention the release",
+		// Triggers the (?i) bug: captured name = "the", verb = "post".
+		// Without the fix this matches because [A-Z] is case-insensitive
+		// under (?i) and matches lowercase "the".
+		"did the post say it",
+	}
+	for _, in := range mustNotMatch {
+		if didNamePattern.MatchString(in) {
+			t.Errorf("didNamePattern matched %q, want no match (lowercase noun)", in)
+		}
+	}
+	mustMatch := []string{
+		"what did Erica say",
+		"did Erica post the recap",
+		"Did Erica mention the deploy",
+		"DID Erica share the link",
+	}
+	for _, in := range mustMatch {
+		if !didNamePattern.MatchString(in) {
+			t.Errorf("didNamePattern did not match %q, want match (proper noun)", in)
+		}
+	}
+}
+
+// TestTruncate_HandlesMultibyteUTF8 locks in that truncate() clips by
+// runes, not bytes. Before the fix, truncate("…foo bar — baz qux", 18)
+// could land inside the em-dash's UTF-8 byte sequence and emit invalid
+// UTF-8 (which then breaks downstream JSON encoders and viewers).
+func TestTruncate_HandlesMultibyteUTF8(t *testing.T) {
+	cases := []struct {
+		in  string
+		max int
+	}{
+		// Em-dash near the boundary.
+		{"foo bar — baz qux quux", 10},
+		{"foo bar — baz qux quux", 9},
+		{"foo bar — baz qux quux", 8},
+		// Emoji near the boundary (4-byte UTF-8).
+		{"deploy 🚀 finally green", 9},
+		{"deploy 🚀 finally green", 8},
+		// Accented characters.
+		{"café société naïve", 6},
+		// Short input — no truncation needed, must still be valid.
+		{"é", 5},
+		// Edge: max=1.
+		{"hello", 1},
+	}
+	for _, tc := range cases {
+		out := truncate(tc.in, tc.max)
+		if !utf8.ValidString(out) {
+			t.Errorf("truncate(%q, %d) = %q (invalid UTF-8)", tc.in, tc.max, out)
+		}
+		if got := utf8.RuneCountInString(out); got > tc.max {
+			t.Errorf("truncate(%q, %d) = %q has %d runes, want <= %d", tc.in, tc.max, out, got, tc.max)
+		}
 	}
 }

@@ -336,6 +336,86 @@ func TestHandleSubagentCall_Success(t *testing.T) {
 	}
 }
 
+// TestHandleSubagentCall_PopulatesStructuredFieldsOnly asserts that the
+// planner dispatches subagents via the structured AgentStart fields
+// (subagent_prompt / subagent_history) and does NOT synthesize a
+// "History Summary:\n…\nPrompt:\n…" envelope as messages[0].
+//
+// Messages remains the wire surface for direct (non-planner) callers
+// — empty here because the planner is the caller and it uses the
+// typed fields instead.
+func TestHandleSubagentCall_PopulatesStructuredFieldsOnly(t *testing.T) {
+	var capturedStart *proto.AgentStart
+	mockExec := &mockExecutor{
+		execFunc: func(ctx context.Context, conversationID string, execID string, start *proto.AgentStart, o agent.OutputHandler) (proto.State, error) {
+			capturedStart = start
+			o(&proto.AgentOutputs{
+				Messages: []*proto.Message{
+					{
+						Role: "model",
+						Content: &proto.Content{
+							Type: &proto.Content_Text{
+								Text: &proto.TextContent{Text: "ok"},
+							},
+						},
+					},
+				},
+			})
+			return proto.State_STATE_COMPLETED, nil
+		},
+	}
+
+	p := &geminiPlannerAgent{
+		config: GeminiPlannerConfig{
+			GeminiConfig: &config.GeminiConfig{Model: "test-model"},
+		},
+	}
+
+	fc := &genai.FunctionCall{
+		Name: "test-subagent",
+		Args: map[string]any{
+			"history": "Previous history summary",
+			"prompt":  "Current user prompt",
+		},
+	}
+
+	history := []*proto.Message{
+		{
+			Role: "user",
+			Content: &proto.Content{
+				Type: &proto.Content_Text{Text: &proto.TextContent{Text: "what's up"}},
+			},
+		},
+	}
+
+	handler := func(outgoing *proto.AgentOutputs) error { return nil }
+
+	if err := p.handleSubagentCall(context.Background(), "test-conv", fc, nil, history, mockExec, handler); err != nil {
+		t.Fatalf("handleSubagentCall failed: %v", err)
+	}
+
+	if capturedStart == nil {
+		t.Fatal("expected executor to receive an AgentStart")
+	}
+
+	// Structured fields populated from typed FunctionCall args.
+	if got, want := capturedStart.GetSubagentPrompt(), "Current user prompt"; got != want {
+		t.Errorf("SubagentPrompt = %q, want %q", got, want)
+	}
+	if got, want := capturedStart.GetSubagentHistory(), "Previous history summary"; got != want {
+		t.Errorf("SubagentHistory = %q, want %q", got, want)
+	}
+
+	// Messages must be empty: planner uses subagent_prompt as the
+	// dispatch surface, not the envelope-string Message we used to
+	// synthesize. Any code at any point in the stack that finds a
+	// "History Summary:\n…\nPrompt:\n…" string in messages[0] is a
+	// regression.
+	if n := len(capturedStart.Messages); n != 0 {
+		t.Errorf("expected Messages to be empty (planner uses subagent_prompt), got %d messages", n)
+	}
+}
+
 func TestHandleSubagentCall_MissingArgs(t *testing.T) {
 	p := &geminiPlannerAgent{}
 	fc := &genai.FunctionCall{

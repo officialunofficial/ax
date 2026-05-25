@@ -28,6 +28,25 @@ message AgentStart {
   string agent_id = 1;
   bytes agent_config = 2;
   repeated Message messages = 3;
+
+  // subagent_prompt is the planner's tool-call `prompt` argument passed
+  // through verbatim when this AgentStart is the result of a planner
+  // dispatching to a subagent. Modern subagents should prefer this field
+  // over parsing free-form text out of `messages`. Empty when the
+  // AgentStart did not originate from a planner subagent dispatch.
+  //
+  // Backward-compat note: the planner ALSO synthesizes a legacy
+  // "History Summary:\n…\nPrompt:\n…" envelope into messages[0] so
+  // pre-existing subagents continue to work unmodified. New subagents
+  // should check this field first and fall back to the message-text path
+  // only when it is empty.
+  string subagent_prompt = 4;
+
+  // subagent_history is the planner's tool-call `history` argument
+  // (a stringified conversation history) passed through verbatim
+  // alongside subagent_prompt. See subagent_prompt for the
+  // backward-compatibility story.
+  string subagent_history = 5;
 }
 
 message AgentOutputs {

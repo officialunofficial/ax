@@ -341,29 +341,23 @@ func (p *geminiPlannerAgent) handleSubagentCall(ctx context.Context, conversatio
 	}
 
 	mappedName := strings.ReplaceAll(fc.Name, "_", "-")
-	var historyStr strings.Builder
-	for _, msg := range history {
-		historyStr.WriteString(fmt.Sprintf("%s: ", msg.Role))
-		if msg.Content != nil {
-			if txt := msg.Content.GetText(); txt != nil {
-				historyStr.WriteString(txt.Text)
-			}
-		}
-		historyStr.WriteString("\n")
-	}
 
+	// Capture Gemini's typed `history` arg as-is — it's the model's own
+	// summarization of the conversation. Empty string when the model
+	// omitted the arg.
+	subagentHistoryArg, _ := fc.Args["history"].(string)
+
+	// Subagents receive the planner's typed function-call arguments via
+	// the structured AgentStart.subagent_prompt / .subagent_history
+	// fields. We do NOT synthesize a fake user-role Message wrapping a
+	// "History Summary:\n…\nPrompt:\n…" string — Messages is left empty
+	// here because it's the wire surface for direct (non-planner)
+	// callers, not for planner-driven dispatch. Subagents read
+	// start.GetSubagentPrompt() directly.
 	subagentStart := &proto.AgentStart{
-		AgentId: mappedName,
-		Messages: []*proto.Message{
-			{
-				Role: "user",
-				Content: &proto.Content{
-					Type: &proto.Content_Text{
-						Text: &proto.TextContent{Text: fmt.Sprintf("History Summary:\n%s\n\nPrompt:\n%s", historyStr.String(), prompt)},
-					},
-				},
-			},
-		},
+		AgentId:         mappedName,
+		SubagentPrompt:  prompt,
+		SubagentHistory: subagentHistoryArg,
 	}
 
 	var subagentOutputs []*proto.Message

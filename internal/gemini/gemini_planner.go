@@ -67,6 +67,13 @@ type geminiPlannerAgent struct {
 	bashTool   Tool
 	skillsTool Tool
 	registry   AgentRegistry
+	// nativeTools is an optional list of Gemini-native Tools (e.g.
+	// google_search, url_context) to plumb through agentsToTools'
+	// nativeTools variadic. No production caller wires this today —
+	// natives are configured via GeminiConfig.Tools and attached in
+	// process() directly — but future callers (and tests) use this to
+	// exercise the merge loop's preservation of native fields.
+	nativeTools []Tool
 }
 
 // NewGeminiPlannerAgent creates a new Gemini-based agent.
@@ -195,9 +202,87 @@ func (p *geminiPlannerAgent) loop(ctx context.Context, conversationID string, st
 }
 
 func (p *geminiPlannerAgent) process(ctx context.Context, conversationID string, start *proto.AgentStart, e agent.Executor, handler agent.OutputHandler) (agentID string, keepLooping bool, err error) {
-	tools, err := agentsToTools(p.registry)
+	rawTools, err := agentsToTools(p.registry, p.nativeTools...)
 	if err != nil {
 		return "", false, fmt.Errorf("failed to convert agents to tools: %w", err)
+	}
+
+	// When native Gemini tools (google_search, url_context, …) are
+	// configured, ALL function declarations + the native tool must live
+	// on the SAME *genai.Tool object. Splitting across multiple Tool
+	// entries causes Gemini 3 to emit the native tool's name as a
+	// regular function call instead of auto-executing it server-side
+	// (empirically confirmed against gemini-3-flash-preview on Vertex).
+	// See https://ai.google.dev/gemini-api/docs/tool-combination
+	//
+	// Flatten agentsToTools' one-Tool-per-agent output into a single
+	// Tool, then attach the configured natives. We also preserve any
+	// native fields (GoogleSearch / URLContext / CodeExecution /
+	// GoogleMaps) carried on the raw Tools — the nativeTools variadic
+	// in agentsToTools can produce those, and dropping them would
+	// silently lose tool capability. First non-nil wins; a warning is
+	// logged if two rawTools set the same native field.
+	mergedTool := &genai.Tool{}
+	for _, t := range rawTools {
+		if t == nil {
+			continue
+		}
+		mergedTool.FunctionDeclarations = append(mergedTool.FunctionDeclarations, t.FunctionDeclarations...)
+		if t.GoogleSearch != nil {
+			if mergedTool.GoogleSearch != nil {
+				fmt.Fprintf(os.Stderr, "warn: multiple rawTools set GoogleSearch; keeping first\n")
+			} else {
+				mergedTool.GoogleSearch = t.GoogleSearch
+			}
+		}
+		if t.URLContext != nil {
+			if mergedTool.URLContext != nil {
+				fmt.Fprintf(os.Stderr, "warn: multiple rawTools set URLContext; keeping first\n")
+			} else {
+				mergedTool.URLContext = t.URLContext
+			}
+		}
+		if t.CodeExecution != nil {
+			if mergedTool.CodeExecution != nil {
+				fmt.Fprintf(os.Stderr, "warn: multiple rawTools set CodeExecution; keeping first\n")
+			} else {
+				mergedTool.CodeExecution = t.CodeExecution
+			}
+		}
+		if t.GoogleMaps != nil {
+			if mergedTool.GoogleMaps != nil {
+				fmt.Fprintf(os.Stderr, "warn: multiple rawTools set GoogleMaps; keeping first\n")
+			} else {
+				mergedTool.GoogleMaps = t.GoogleMaps
+			}
+		}
+	}
+	for _, t := range p.config.GeminiConfig.Tools {
+		switch t {
+		case "google_search":
+			mergedTool.GoogleSearch = &genai.GoogleSearch{}
+		case "url_context":
+			mergedTool.URLContext = &genai.URLContext{}
+		case "code_execution":
+			mergedTool.CodeExecution = &genai.ToolCodeExecution{}
+		case "google_maps":
+			mergedTool.GoogleMaps = &genai.GoogleMaps{}
+		default:
+			return "", false, fmt.Errorf("unsupported native planner tool: %q", t)
+		}
+	}
+	// Vertex rejects a Tool with zero content
+	// ("400 INVALID_ARGUMENT: Tool must contain at least one of
+	// function_declarations, google_search, url_context, code_execution").
+	// Only include mergedTool when it actually has content; otherwise
+	// send no tools at all.
+	var tools []*genai.Tool
+	if len(mergedTool.FunctionDeclarations) > 0 ||
+		mergedTool.GoogleSearch != nil ||
+		mergedTool.URLContext != nil ||
+		mergedTool.CodeExecution != nil ||
+		mergedTool.GoogleMaps != nil {
+		tools = []*genai.Tool{mergedTool}
 	}
 
 	inputs := start.Messages
